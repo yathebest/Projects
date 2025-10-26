@@ -3,7 +3,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import svds
 from tqdm.auto import trange
 
-from libs.utils import ITEM, USER, TARGET
+from .constants import *
 
 
 class SVDModel:
