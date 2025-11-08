@@ -2,6 +2,7 @@ USER = 'user_id'
 ITEM = 'item_id'
 AUTHOR = 'author_id'
 EMBEDDING = 'embedding'
+TIME_INDEX = 'time_index'
 
 TARGET = "rank"
 INTERACTIONS_NUM_FEATURES = ['timespent']

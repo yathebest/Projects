@@ -76,17 +76,25 @@ class Loader:
     def _create_lazy_datasets(self) -> Tuple[pl.LazyFrame, pl.LazyFrame]:
         (train_files, val_files), _ = self._get_files()
         train, val = [], []
+        time_offset = 0
         self.train_size = 0
         self.val_size = 0
 
-        for file in train_files:
+
+        for file in train_files:  # first train by time
             df = pl.scan_parquet(f'{DATA_DIR}/{file}')
-            self.train_size += df.select(pl.len()).collect().item()
+            df = df.with_columns((pl.row_index()+pl.lit(time_offset)).alias(TIME_INDEX))
+            count = df.select(pl.len()).collect().item()
+            time_offset += count
+            self.train_size += count
             train.append(df)
 
-        for file in val_files:
+        for file in val_files:  # then val by time
             df = pl.scan_parquet(f'{DATA_DIR}/{file}')
-            self.val_size += df.select(pl.len()).collect().item()
+            df = df.with_columns((pl.row_index()+pl.lit(time_offset)).alias(TIME_INDEX))
+            count =  df.select(pl.len()).collect().item()
+            time_offset += count
+            self.val_size += count
             val.append(df)
 
         return pl.concat(train), pl.concat(val)
