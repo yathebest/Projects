@@ -223,7 +223,7 @@ class Loader:
 
         return train_filtered, val_filtered, users_metadata, items_metadata
 
-    def load_data(self, convert_to_pandas=True):
+    def load_data(self, convert_to_pandas=True, filter_data=True):
         self._ensure_files_exist()
 
         print("Load metadata")
@@ -245,6 +245,13 @@ class Loader:
             users_metadata, items_metadata, train_users, train_items,
             filtered_ids, filtered_embeddings
         )
+
+        if not filter_data:
+            if convert_to_pandas:
+                return  ((train_lazy.collect().to_pandas(), val_lazy.collect().to_pandas()),
+                         users_metadata.collect().to_pandas(), items_metadata.collect().to_pandas())
+
+            return (train_lazy, val_lazy), users_metadata, items_metadata
 
         print("Compute aggregates")
         users_agg, items_agg = self._compute_aggregates(train_lazy)
