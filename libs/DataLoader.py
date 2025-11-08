@@ -1,111 +1,288 @@
 import os
-from functools import reduce
+from typing import Tuple, Optional
 
 import numpy as np
-import pandas as pd
-from huggingface_hub import hf_hub_download
+import polars as pl
 from tqdm.auto import tqdm
+from huggingface_hub import hf_hub_download
 
 from .constants import *
 
+
 class Loader:
-    def __init__(self, subsample_name: str, content_embedding_size: int=64):
+    def __init__(self, subsample_name: str, content_embedding_size: int = 64, batch_size: int | None = None):
         self.subsample_name = subsample_name
         self.content_embedding_size = content_embedding_size
+        self.batch_size = batch_size
+        self.train_size = None
+        self.val_size = None
 
-    def _get_files(self):
+    def _get_files(self) -> Tuple[Tuple[list, list], list]:
         train_interactions_files = [f'subsamples/{self.subsample_name}/train/week_{i:02}.parquet' for i in range(25)]
         val_interactions_files = [f'subsamples/{self.subsample_name}/validation/week_25.parquet']
         metadata_files = ['metadata/users_metadata.parquet', 'metadata/items_metadata.parquet', 'metadata/item_embeddings.npz']
         return (train_interactions_files, val_interactions_files), metadata_files
 
-    def _download_files(self, files: list=None):
+    def _download_files(self, files: list = None):
         if files is None:
             (t, v), m = self._get_files()
-            files = t+v+m
+            files = t + v + m
 
-        for file in files:
+        for file in tqdm(files):
             hf_hub_download(
                 repo_id='deepvk/VK-LSVD', repo_type='dataset',
                 filename=file, local_dir=DATA_DIR
             )
 
-    def _load_data(self):
-        (train_interactions_files, val_interactions_file), metadata_files = self._get_files()
-        files = train_interactions_files + val_interactions_file + metadata_files
-        files = list(filter(lambda path: not os.path.exists(f'{DATA_DIR}/{path}'), files))
-        if len(files) != 0:
-            print(f"{len(files)} files not found, downloading...")
-            self._download_files(files)
+    def _ensure_files_exist(self, files: Optional[list[str]] = None):
+        if files is None:
+            (train_files, val_files), metadata_files = self._get_files()
+            all_files = train_files + val_files + metadata_files
+        else:
+            all_files = files
 
-        train_interactions = pd.concat([pd.read_parquet(f'{DATA_DIR}/{file}') for file in train_interactions_files])
-        val_interactions = pd.concat([pd.read_parquet(f'{DATA_DIR}/{file}') for file in val_interactions_file])
+        missing_files = [f for f in all_files if not os.path.exists(f'{DATA_DIR}/{f}')]
 
-        users_metadata = pd.read_parquet(f'{DATA_DIR}/metadata/users_metadata.parquet')
-        items_metadata = pd.read_parquet(f'{DATA_DIR}/metadata/items_metadata.parquet')
+        if missing_files:
+            print(f"{len(missing_files)} files not found, downloading...")
+            self._download_files(missing_files)
 
-        train_users = train_interactions[USER].unique()
-        train_items = train_interactions[ITEM].unique()
+    def _get_num_batches_train(self) -> int:
+        if self.batch_size is not None and self.train_size is not None:
+            return (self.train_size / self.batch_size).__ceil__()
+        return 1
+
+    def _get_num_batches_val(self):
+        if self.batch_size is not None and self.val_size is not None:
+            return (self.val_size / self.batch_size).__ceil__()
+        return 1
+
+    def _create_target_expression(self) -> pl.Expr:
+        target_expr = pl.lit(0)
+        for interaction, weight in INTERACTIONS_MAP.items():
+            target_expr = target_expr + pl.col(interaction) * weight
+        return target_expr.alias(TARGET)
+
+    def _load_metadata(self) -> Tuple[pl.LazyFrame, pl.LazyFrame, np.ndarray, np.ndarray]:
+        users_metadata = pl.scan_parquet(f'{DATA_DIR}/metadata/users_metadata.parquet')
+        items_metadata = pl.scan_parquet(f'{DATA_DIR}/metadata/items_metadata.parquet')
 
         item_emb = np.load(f'{DATA_DIR}/metadata/item_embeddings.npz')
         item_ids = item_emb[ITEM]
         item_embeddings = item_emb[EMBEDDING]
 
-        mask = np.isin(item_ids, train_items)
-        item_ids = item_ids[mask]
-        item_embeddings = item_embeddings[mask]
-        item_embeddings = item_embeddings[:, :self.content_embedding_size]
+        return users_metadata, items_metadata, item_ids, item_embeddings
 
-        users_metadata = users_metadata.merge(pd.DataFrame({USER: train_users}), on=USER, how='inner')
-        items_metadata = items_metadata.merge(pd.DataFrame({ITEM: train_items}), on=ITEM, how='inner')
-        items_metadata = items_metadata.merge(pd.DataFrame({ITEM: item_ids, EMBEDDING: item_embeddings.tolist()}), on=ITEM, how='inner')
+    def _create_lazy_datasets(self) -> Tuple[pl.LazyFrame, pl.LazyFrame]:
+        (train_files, val_files), _ = self._get_files()
+        train, val = [], []
+        self.train_size = 0
+        self.val_size = 0
 
-        return (train_interactions, val_interactions), users_metadata, items_metadata
+        for file in train_files:
+            df = pl.scan_parquet(f'{DATA_DIR}/{file}')
+            self.train_size += df.select(pl.len()).collect().item()
+            train.append(df)
 
-    def load_data(self):
-        (train, val), users, items = self._load_data()
-        tl, vl, ul, il = map(len, [train, val, users, items])
+        for file in val_files:
+            df = pl.scan_parquet(f'{DATA_DIR}/{file}')
+            self.val_size += df.select(pl.len()).collect().item()
+            val.append(df)
 
-        for df in [train, val]:
-            df[TARGET] = reduce(lambda x, y: x.add(y), [v * df[k] for k,v in INTERACTIONS_MAP.items()])
-            df.drop(columns=INTERACTIONS_MAP.keys(), inplace=True)
+        return pl.concat(train), pl.concat(val)
 
-        for df in [train, val, users, items]:
-            df.drop(columns="train_interactions_rank", inplace=True, errors='ignore')
+    def _get_unique_items_users(self, train_lazy: pl.LazyFrame) -> Tuple[pl.Series, pl.Series]:
+        items_set = set()
+        users_set = set()
 
-        agg_df = train.merge(items, on=ITEM)[[USER, ITEM, AUTHOR, TARGET]]
-        users_agg, items_agg = [
-            grouped.agg(
-                positive=(TARGET, lambda x: (x>0).sum()),
-                negative=(TARGET, lambda x: (x<0).sum()),
-                count=(TARGET, 'count'),
-                score=(TARGET, 'sum'),
-            )
-            for grouped in tqdm([agg_df.groupby(USER), agg_df.groupby(ITEM)])
-        ]
+        iterable = tqdm(
+            train_lazy.collect_batches(chunk_size=self.batch_size),
+            total=self._get_num_batches_train()
+        ) if self.batch_size else [train_lazy.collect()]
 
-        users_filtered = users_agg[
-            (users_agg["count"] > 100)  # Не выгодно показывать клипы юзерам, которые не интересуются клипами
-                & (users_agg["positive"].mean() > 0.05)  # Не выгодно показывать клипы юзерам которые смотрят, но не лайкают
-                & (users_agg["negative"].mean() < 0.05)  # Не выгодно показывать клипы юзерам, которые много дизлайкают
-        ]
-        items_filtered = items_agg # Фильтровать айтемы и авторов не имеет смысла, мы предсказываем для всех данных айтемов
+        for batch in iterable:
+            # batch is an eager pl.DataFrame
+            if ITEM in batch.columns:
+                items_set.update(batch[ITEM].unique().to_list())
+            if USER in batch.columns:
+                users_set.update(batch[USER].unique().to_list())
 
-        users = users.merge(users_filtered[[]], left_on=USER, right_index=True, how='inner')
-        print(f"Users: {ul:_} -> {len(users):_}")
+        items_series = pl.Series(ITEM, list(items_set))
+        users_series = pl.Series(USER, list(users_set))
+        return items_series, users_series
 
-        items = items.merge(items_filtered[[]], left_on=ITEM, right_index=True, how='inner')
-        print(f"Items: {il:_} -> {len(items):_}")
+    def _filter_embeddings(self, item_ids: np.ndarray, item_embeddings: np.ndarray, train_items: pl.Series):
+        train_items_set = set(train_items.to_list())
+        mask = np.isin(item_ids, list(train_items_set))
+        filtered_ids = item_ids[mask]
+        filtered_embeddings = item_embeddings[mask]
+        filtered_embeddings = filtered_embeddings[:, :self.content_embedding_size]
 
-        train = train\
-            .merge(users_filtered[[]], left_on=USER, right_index=True, how='inner')\
-            .merge(items_filtered[[]], left_on=ITEM, right_index=True, how='inner')
-        print(f"Train: {tl:_} -> {len(train):_}")
+        return filtered_ids, filtered_embeddings
 
-        val = val \
-            .merge(users_filtered[[]], left_on=USER, right_index=True, how='inner') \
-            .merge(items_filtered[[]], left_on=ITEM, right_index=True, how='inner')
-        print(f"Val: {vl:_} -> {len(val):_}")
+    def _process_metadata(self, users_metadata: pl.LazyFrame, items_metadata: pl.LazyFrame,
+                          train_users: pl.Series, train_items: pl.Series,
+                          filtered_ids: np.ndarray, filtered_embeddings: np.ndarray):
+        train_users_df = pl.LazyFrame({USER: train_users})
+        train_items_df = pl.LazyFrame({ITEM: train_items})
 
-        print(f"Train: {len(train):_} Val: {len(val):_} Users: {len(users):_} Items: {len(items):_}")
-        return (train, val), users, items
+        users_metadata = users_metadata.join(train_users_df, on=USER, how='inner')
+        items_metadata = items_metadata.join(train_items_df, on=ITEM, how='inner')
+
+        embeddings_df = pl.LazyFrame({ITEM: filtered_ids, EMBEDDING: filtered_embeddings})
+        items_metadata = items_metadata.join(embeddings_df, on=ITEM, how='inner')
+
+        return users_metadata, items_metadata
+
+    def _compute_aggregates(self, train_lazy: pl.LazyFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
+        users_acc = None
+        items_acc = None
+
+        iterable = tqdm(
+            train_lazy.collect_batches(chunk_size=self.batch_size),
+            total=self._get_num_batches_train()
+        ) if self.batch_size else [train_lazy.collect()]
+
+        for batch in iterable:
+            batch = batch.with_columns([self._create_target_expression()])
+
+            user_batch = batch.group_by(USER).agg([
+                pl.col(TARGET).filter(pl.col(TARGET) > 0).count().alias("positive"),
+                pl.col(TARGET).filter(pl.col(TARGET) < 0).count().alias("negative"),
+                pl.col(TARGET).count().alias("count"),
+                pl.col(TARGET).sum().alias("score")
+            ])
+
+            item_batch = batch.group_by(ITEM).agg([
+                pl.col(TARGET).filter(pl.col(TARGET) > 0).count().alias("positive"),
+                pl.col(TARGET).filter(pl.col(TARGET) < 0).count().alias("negative"),
+                pl.col(TARGET).count().alias("count"),
+                pl.col(TARGET).sum().alias("score")
+            ])
+
+            # accumulate by concatenating and then summing groups (keeps memory small: one row per unique user/item)
+            if users_acc is None:
+                users_acc = user_batch
+            else:
+                users_acc = pl.concat([users_acc, user_batch]).group_by(USER).agg([
+                    pl.col("positive").sum().alias("positive"),
+                    pl.col("negative").sum().alias("negative"),
+                    pl.col("count").sum().alias("count"),
+                    pl.col("score").sum().alias("score")
+                ])
+
+            if items_acc is None:
+                items_acc = item_batch
+            else:
+                items_acc = pl.concat([items_acc, item_batch]).group_by(ITEM).agg([
+                    pl.col("positive").sum().alias("positive"),
+                    pl.col("negative").sum().alias("negative"),
+                    pl.col("count").sum().alias("count"),
+                    pl.col("score").sum().alias("score")
+                ])
+
+        if users_acc is None:
+            users_acc = pl.DataFrame({USER: [], "positive": [], "negative": [], "count": [], "score": []})
+        if items_acc is None:
+            items_acc = pl.DataFrame({ITEM: [], "positive": [], "negative": [], "count": [], "score": []})
+
+        return users_acc, items_acc
+
+    def _filter_data(self, users_agg: pl.DataFrame, items_agg: pl.DataFrame,
+                     users_metadata: pl.LazyFrame, items_metadata: pl.LazyFrame,
+                     train: pl.LazyFrame, val: pl.LazyFrame):
+        users_filtered = users_agg.filter(
+            (pl.col("count") > 100) &
+            (pl.col("positive") / pl.col("count") > 0.05) &
+            (pl.col("negative") / pl.col("count") < 0.05)
+        )
+        items_filtered = items_agg  # keep as-is (you can add item-level filters here)
+
+        # convert filtered user/item lists to Python lists (should fit memory)
+        users_keep = users_filtered.select(USER).to_series().to_list()
+        items_keep = items_filtered.select(ITEM).to_series().to_list()
+
+        users_metadata = users_metadata.join(
+            pl.DataFrame({USER: users_keep}).lazy(), on=USER, how='inner'
+        )
+        items_metadata = items_metadata.join(
+            pl.DataFrame({ITEM: items_keep}).lazy(), on=ITEM, how='inner'
+        )
+
+        # Build lazy selections for joins on large datasets
+        users_keep_lazy = pl.DataFrame({USER: users_keep}).lazy().select(USER)
+        items_keep_lazy = pl.DataFrame({ITEM: items_keep}).lazy().select(ITEM)
+
+        train_filtered = (train
+                          .join(users_keep_lazy, on=USER, how='inner')
+                          .join(items_keep_lazy, on=ITEM, how='inner'))
+
+        val_filtered = (val
+                        .join(users_keep_lazy, on=USER, how='inner')
+                        .join(items_keep_lazy, on=ITEM, how='inner'))
+
+        return train_filtered, val_filtered, users_metadata, items_metadata
+
+    def load_data(self, convert_to_pandas=True):
+        self._ensure_files_exist()
+
+        print("Load metadata")
+        users_metadata, items_metadata, item_ids, item_embeddings = self._load_metadata()
+
+        print("Create lazy interaction datasets")
+        train_lazy, val_lazy = self._create_lazy_datasets()
+
+        print("Get unique users/items")
+        train_items, train_users = self._get_unique_items_users(train_lazy)
+
+        print("Filter embeddings")
+        filtered_ids, filtered_embeddings = self._filter_embeddings(
+            item_ids, item_embeddings, train_items
+        )
+
+        print("Process metadata")
+        users_metadata, items_metadata = self._process_metadata(
+            users_metadata, items_metadata, train_users, train_items,
+            filtered_ids, filtered_embeddings
+        )
+
+        print("Compute aggregates")
+        users_agg, items_agg = self._compute_aggregates(train_lazy)
+
+        print("Filter interactions")
+        train_filtered, val_filtered, users_metadata, items_metadata = self._filter_data(
+            users_agg, items_agg, users_metadata, items_metadata, train_lazy, val_lazy
+        )
+
+        print("Finalize interactions")
+        target_expr = self._create_target_expression()
+
+        train_final = (train_filtered
+                       .with_columns([target_expr])
+                       .drop(list(INTERACTIONS_MAP.keys()), strict=False)
+                       .drop("train_interactions_rank", strict=False)
+                       .filter(pl.col(TARGET).ne(0)))
+
+        val_final = (val_filtered
+                     .with_columns([target_expr])
+                     .drop(list(INTERACTIONS_MAP.keys()), strict=False)
+                     .drop("train_interactions_rank", strict=False)
+                     .filter(pl.col(TARGET).ge(0)))
+
+        users_metadata = users_metadata.drop("train_interactions_rank", strict=False)
+        items_metadata = items_metadata.drop("train_interactions_rank", strict=False)
+
+        print("Count")
+        train_count = train_final.select(pl.count()).collect().item()
+        val_count = val_final.select(pl.count()).collect().item()
+        users_count = users_metadata.select(pl.count()).collect().item()
+        items_count = items_metadata.select(pl.count()).collect().item()
+
+        print(f"Train: {train_count:_} Val: {val_count:_} "
+              f"Users: {users_count:_} Items: {items_count:_}")
+
+        if convert_to_pandas:
+            return  ((train_final.collect().to_pandas(), val_final.collect().to_pandas()),
+                     users_metadata.collect().to_pandas(), items_metadata.collect().to_pandas())
+
+        return (train_final, val_final), users_metadata, items_metadata

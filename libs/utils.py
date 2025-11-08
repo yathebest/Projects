@@ -21,8 +21,7 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
             if user in true_users:
                 dcg += 1 / np.log2(i + 2)
 
-        k = min(len(true_users), 100)
-        idcg = sum(1 / np.log2(i + 2) for i in range(k))
+        idcg = (1 / np.log2(np.arange(min(len(true_users), 100)) + 2)).sum()
 
         return dcg / idcg if idcg > 0 else 0.0
 
@@ -32,12 +31,11 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
 def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
-    ).fillna({USER+'s_pred': []})
+    ).fillna({USER+'s_pred': ""})
 
     def calculate_dcg(row):
         pred_users = row[USER+'s_pred']
         true_users = set(row[USER+'s_true'])
-
         if not pred_users or not true_users:
             return 0.0
 
