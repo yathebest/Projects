@@ -1,18 +1,20 @@
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 
 from .constants import *
 
 def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
-    """submission is DataFrame[nItems x 2] with columns (item_id, user_ids), where user_ids is List[100]
-    true_reactions is DataFrame[nItems x 2] with columns (item_id, user_ids), where user_ids is List"""
+    """submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
+    true_reactions is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List"""
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
-    ).fillna({USER+'s_pred': ""})
+    ).fillna({USER+'_pred': ""})
 
     def calculate_ndcg(row):
-        pred_users = row[USER+'s_pred']
-        true_users = set(row[USER+'s_true'])
+        pred_users = row[USER+'_pred']
+        true_users = set(row[USER+'_true'])
         if not pred_users or not true_users:
             return 0.0
 
@@ -31,11 +33,11 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
 def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
-    ).fillna({USER+'s_pred': ""})
+    ).fillna({USER+'_pred': ""})
 
     def calculate_dcg(row):
-        pred_users = row[USER+'s_pred']
-        true_users = set(row[USER+'s_true'])
+        pred_users = row[USER+'_pred']
+        true_users = set(row[USER+'_true'])
         if not pred_users or not true_users:
             return 0.0
 
