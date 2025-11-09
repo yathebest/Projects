@@ -7,6 +7,7 @@ from tqdm.auto import tqdm
 from huggingface_hub import hf_hub_download
 
 from .constants import *
+from .utils import count_polars
 
 
 class Loader:
@@ -47,8 +48,7 @@ class Loader:
 
     def _get_num_batches(self, data: pl.LazyFrame) -> int:
         if self.batch_size is not None:
-            count = data.select(pl.len()).collect().item()
-            return (count / self.batch_size).__ceil__()
+            return (count_polars(data) / self.batch_size).__ceil__()
         return 1
 
     def _create_target_expression(self) -> pl.Expr:
@@ -75,15 +75,13 @@ class Loader:
         for file in train_files:  # first train by time
             df = pl.scan_parquet(f'{DATA_DIR}/{file}')
             df = df.with_columns((pl.row_index()+pl.lit(time_offset)).alias(TIME_INDEX))
-            count = df.select(pl.len()).collect().item()
-            time_offset += count
+            time_offset += count_polars(df)
             train.append(df)
 
         for file in val_files:  # then val by time
             df = pl.scan_parquet(f'{DATA_DIR}/{file}')
             df = df.with_columns((pl.row_index()+pl.lit(time_offset)).alias(TIME_INDEX))
-            count =  df.select(pl.len()).collect().item()
-            time_offset += count
+            time_offset += count_polars(df)
             val.append(df)
 
         return pl.concat(train), pl.concat(val)
@@ -279,13 +277,8 @@ class Loader:
         items_metadata = items_metadata.drop("train_interactions_rank", strict=False)
 
         print("Count")
-        train_count = train_final.select(pl.count()).collect().item()
-        val_count = val_final.select(pl.count()).collect().item()
-        users_count = users_metadata.select(pl.count()).collect().item()
-        items_count = items_metadata.select(pl.count()).collect().item()
-
-        print(f"Train: {train_count:_} Val: {val_count:_} "
-              f"Users: {users_count:_} Items: {items_count:_}")
+        print(f"Train: {count_polars(train_final):_} Val: {count_polars(val_final):_} "
+              f"Users: {count_polars(users_metadata):_} Items: {count_polars(items_metadata):_}")
 
         if convert_to_pandas:
             print("Convert to pandas")
