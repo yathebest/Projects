@@ -14,8 +14,6 @@ class Loader:
         self.subsample_name = subsample_name
         self.content_embedding_size = content_embedding_size
         self.batch_size = batch_size
-        self.train_size = None
-        self.val_size = None
 
     def _get_files(self) -> Tuple[Tuple[list, list], list]:
         train_interactions_files = [f'subsamples/{self.subsample_name}/train/week_{i:02}.parquet' for i in range(25)]
@@ -47,14 +45,10 @@ class Loader:
             print(f"{len(missing_files)} files not found, downloading...")
             self._download_files(missing_files)
 
-    def _get_num_batches_train(self) -> int:
-        if self.batch_size is not None and self.train_size is not None:
-            return (self.train_size / self.batch_size).__ceil__()
-        return 1
-
-    def _get_num_batches_val(self):
-        if self.batch_size is not None and self.val_size is not None:
-            return (self.val_size / self.batch_size).__ceil__()
+    def _get_num_batches(self, data: pl.LazyFrame) -> int:
+        if self.batch_size is not None:
+            count = data.select(pl.len()).collect().item()
+            return (count / self.batch_size).__ceil__()
         return 1
 
     def _create_target_expression(self) -> pl.Expr:
@@ -77,16 +71,12 @@ class Loader:
         (train_files, val_files), _ = self._get_files()
         train, val = [], []
         time_offset = 0
-        self.train_size = 0
-        self.val_size = 0
-
 
         for file in train_files:  # first train by time
             df = pl.scan_parquet(f'{DATA_DIR}/{file}')
             df = df.with_columns((pl.row_index()+pl.lit(time_offset)).alias(TIME_INDEX))
             count = df.select(pl.len()).collect().item()
             time_offset += count
-            self.train_size += count
             train.append(df)
 
         for file in val_files:  # then val by time
@@ -94,19 +84,18 @@ class Loader:
             df = df.with_columns((pl.row_index()+pl.lit(time_offset)).alias(TIME_INDEX))
             count =  df.select(pl.len()).collect().item()
             time_offset += count
-            self.val_size += count
             val.append(df)
 
         return pl.concat(train), pl.concat(val)
 
-    def _get_unique_items_users(self, train_lazy: pl.LazyFrame) -> Tuple[pl.Series, pl.Series]:
+    def _get_unique_items_users(self, data_lazy: pl.LazyFrame) -> Tuple[pl.Series, pl.Series]:
         items_set = set()
         users_set = set()
 
         iterable = tqdm(
-            train_lazy.collect_batches(chunk_size=self.batch_size),
-            total=self._get_num_batches_train()
-        ) if self.batch_size else [train_lazy.collect()]
+            data_lazy.collect_batches(chunk_size=self.batch_size),
+            total=self._get_num_batches(data_lazy)
+        ) if self.batch_size else [data_lazy.collect()]
 
         for batch in iterable:
             # batch is an eager pl.DataFrame
@@ -119,9 +108,8 @@ class Loader:
         users_series = pl.Series(USER, list(users_set))
         return items_series, users_series
 
-    def _filter_embeddings(self, item_ids: np.ndarray, item_embeddings: np.ndarray, train_items: pl.Series):
-        train_items_set = set(train_items.to_list())
-        mask = np.isin(item_ids, list(train_items_set))
+    def _filter_embeddings(self, item_ids: np.ndarray, item_embeddings: np.ndarray, items: pl.Series):
+        mask = np.isin(item_ids, items.to_list())
         filtered_ids = item_ids[mask]
         filtered_embeddings = item_embeddings[mask]
         filtered_embeddings = filtered_embeddings[:, :self.content_embedding_size]
@@ -129,27 +117,27 @@ class Loader:
         return filtered_ids, filtered_embeddings
 
     def _process_metadata(self, users_metadata: pl.LazyFrame, items_metadata: pl.LazyFrame,
-                          train_users: pl.Series, train_items: pl.Series,
+                          users: pl.Series, items: pl.Series,
                           filtered_ids: np.ndarray, filtered_embeddings: np.ndarray):
-        train_users_df = pl.LazyFrame({USER: train_users})
-        train_items_df = pl.LazyFrame({ITEM: train_items})
+        users_df = pl.LazyFrame({USER: users})
+        items_df = pl.LazyFrame({ITEM: items})
 
-        users_metadata = users_metadata.join(train_users_df, on=USER, how='inner')
-        items_metadata = items_metadata.join(train_items_df, on=ITEM, how='inner')
+        users_metadata = users_metadata.join(users_df, on=USER, how='inner')
+        items_metadata = items_metadata.join(items_df, on=ITEM, how='inner')
 
         embeddings_df = pl.LazyFrame({ITEM: filtered_ids, EMBEDDING: filtered_embeddings})
         items_metadata = items_metadata.join(embeddings_df, on=ITEM, how='inner')
 
         return users_metadata, items_metadata
 
-    def _compute_aggregates(self, train_lazy: pl.LazyFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    def _compute_aggregates(self, data_lazy: pl.LazyFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
         users_acc = None
         items_acc = None
 
         iterable = tqdm(
-            train_lazy.collect_batches(chunk_size=self.batch_size),
-            total=self._get_num_batches_train()
-        ) if self.batch_size else [train_lazy.collect()]
+            data_lazy.collect_batches(chunk_size=self.batch_size),
+            total=self._get_num_batches(data_lazy)
+        ) if self.batch_size else [data_lazy.collect()]
 
         for batch in iterable:
             batch = batch.with_columns([self._create_target_expression()])
@@ -242,15 +230,18 @@ class Loader:
 
         print("Get unique users/items")
         train_items, train_users = self._get_unique_items_users(train_lazy)
+        val_items, val_users = self._get_unique_items_users(val_lazy)
+        all_items = pl.concat([train_items, val_items]).unique()
+        all_users = pl.concat([train_users, val_users]).unique()
 
         print("Filter embeddings")
         filtered_ids, filtered_embeddings = self._filter_embeddings(
-            item_ids, item_embeddings, train_items
+            item_ids, item_embeddings, all_items
         )
 
         print("Process metadata")
         users_metadata, items_metadata = self._process_metadata(
-            users_metadata, items_metadata, train_users, train_items,
+            users_metadata, items_metadata, all_users, all_items,
             filtered_ids, filtered_embeddings
         )
 
@@ -297,6 +288,7 @@ class Loader:
               f"Users: {users_count:_} Items: {items_count:_}")
 
         if convert_to_pandas:
+            print("Convert to pandas")
             return  ((train_final.collect().to_pandas(), val_final.collect().to_pandas()),
                      users_metadata.collect().to_pandas(), items_metadata.collect().to_pandas())
 
