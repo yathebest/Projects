@@ -1,9 +1,9 @@
-from collections import defaultdict
-
 import numpy as np
 import pandas as pd
+import polars as pl
 
 from .constants import *
+
 
 def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     """submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
@@ -15,6 +15,12 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     def calculate_ndcg(row):
         pred_users = row[USER+'_pred']
         true_users = set(row[USER+'_true'])
+
+        if isinstance(pred_users, np.ndarray):
+            pred_users = pred_users.tolist()
+        if isinstance(true_users, np.ndarray):
+            true_users = true_users.tolist()
+
         if not pred_users or not true_users:
             return 0.0
 
@@ -38,6 +44,12 @@ def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     def calculate_dcg(row):
         pred_users = row[USER+'_pred']
         true_users = set(row[USER+'_true'])
+
+        if isinstance(pred_users, np.ndarray):
+            pred_users = pred_users.tolist()
+        if isinstance(true_users, np.ndarray):
+            true_users = true_users.tolist()
+
         if not pred_users or not true_users:
             return 0.0
 
@@ -50,3 +62,6 @@ def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
 
     dcg = df.apply(calculate_dcg, axis=1).mean()
     return dcg
+
+def count_polars(df: pl.LazyFrame | pl.DataFrame):
+    return df.select(pl.len()).collect().item()
