@@ -8,8 +8,9 @@ from numpy.typing import NDArray
 from ortools.graph.python.min_cost_flow import SimpleMinCostFlow
 from tqdm.auto import tqdm
 
+from .Trainer import Trainer
 from .constants import *
-from .utils import count_polars
+from .utils import build_embeddings_map
 
 U = TypeVar('U', bound=Hashable)
 I = TypeVar('I', bound=Hashable)
@@ -17,29 +18,24 @@ I = TypeVar('I', bound=Hashable)
 class Solver(Generic[I, U]):
     """
     Two-phase solver:
-      1) Stream scores from `score_generator` and keep top-L candidates per item.
-      2) Solve reduced assignment with min-cost flow (OR-Tools) or greedy fallback.
+        1) Stream scores while 'collect_candidates' and keep top-L candidates per item.
+        2) Solve reduced assignment with min-cost flow.
 
-    Parameters
-    ----------
-    candidates_to_keep : int
-        Number of candidates to keep per item (memory/quality knob).
-    top_per_item : int
-        Number of users to select per item.
-    max_per_user : int
-        Max times a user can be assigned across all items.
-    use_ortools : bool
-        If True, prefer OR-Tools solver when available; otherwise use greedy fallback.
-    score_scale : float
-        Scaling factor for converting float scores to integer costs for OR-Tools.
+    :param trainer: model trainer with aggregated data
+    :param candidates_to_keep: Number of candidates to keep per item (memory/quality knob).
+    :param top_per_item: Number of users to select per item.
+    :param max_per_user: Max times a user can be assigned across all items.
+    :param score_scale: Scaling factor for converting float scores to integer costs for OR-Tools.
     """
 
-    def __init__(self, candidates_to_keep: int, top_per_item: int, max_per_user: int,
-                 use_ortools: bool = True, score_scale: float = 1e6):
+    def __init__(self, trainer: Trainer,
+                 candidates_to_keep: int,
+                 top_per_item: int = 100, max_per_user: int = 100,
+                 score_scale: float = 1e6):
+        self.trainer = trainer
         self.L = candidates_to_keep
         self.K = top_per_item
         self.R = max_per_user
-        self.use_ortools = use_ortools
         self.score_scale = score_scale
 
         # item -> dict(user -> best_score)
@@ -47,20 +43,14 @@ class Solver(Generic[I, U]):
         # item -> heap of (score, user) used to evict smallest when > L
         self._item_heaps: Dict[I, List[Tuple[float, U]]] = {}
 
-    def collect_candidates(self, data: pl.LazyFrame, val: pl.LazyFrame, items_df: pl.LazyFrame, model,
-                           users_batch_size: int=1_000_000, items_batch_size: int=1_000_000):
+    def collect_candidates(self, users_batch_size: int=1_000_000, items_batch_size: int=1_000_000):
         """
-        :param data: LazyFrame with columns [ITEM, USER, TIME_INDEX, TARGET], where USER, TIME_INDEX, TARGET are List[n_user_interactions]
-        :param val: LazyFrame with columns [ITEM] - data to predict
-        :param items_df: LazyFrame with index [ITEM] and columns [EMBEDDING] - contains all items with their embeddings
         :param users_batch_size: batching for users
         :param items_batch_size: batching for items
         """
-        score_gen = Solver._score_generator(data, val, items_df, model, users_batch_size, items_batch_size)
+        score_gen = self._score_generator(users_batch_size, items_batch_size)
         for batch_scores, users, items in score_gen:
-            # iterate columns (items) to avoid iterating over full matrix
             for col_idx, item in enumerate(items):
-                # lazy init per item
                 mapping = self._item_to_user_score.get(item)
                 if mapping is None:
                     mapping = {}
@@ -68,74 +58,57 @@ class Solver(Generic[I, U]):
                     self._item_heaps[item] = []
 
                 heap = self._item_heaps[item]
-                # extract column vector of scores
-                # assume batch_scores is numpy-like with indexing [row, col]
                 col_scores = batch_scores[:, col_idx]
                 for row_idx, user in enumerate(users):
                     s = float(col_scores[row_idx])
-                    # if user already present, possibly update
                     prev = mapping.get(user)
                     if prev is None:
-                        # add if there's room
                         if len(mapping) < self.L:
                             mapping[user] = s
                             heapq.heappush(heap, (s, user))
                         else:
-                            # If new score beats current min, add and evict
-                            # heap[0] is smallest (min-heap)
                             if heap and s > heap[0][0]:
                                 mapping[user] = s
                                 heapq.heappush(heap, (s, user))
-                                # Evict until mapping size <= L and heap top matches mapping
                                 self._evict_until_within_L(item)
                     else:
-                        # user already present: update if this score is larger
                         if s > prev:
                             mapping[user] = s
                             heapq.heappush(heap, (s, user))
-                            # If mapping grew beyond L (shouldn't unless we inserted new user), evict
                             if len(mapping) > self.L:
                                 self._evict_until_within_L(item)
 
-        # After all batches, optionally prune heap leftovers (make mapping consistent)
         for item in list(self._item_to_user_score.keys()):
             self._cleanup_item_heap(item)
 
-    @staticmethod
-    def _score_generator(data: pl.LazyFrame, val: pl.LazyFrame, items_df: pl.LazyFrame, model,
-                         users_batch_size: int=1_000_000, items_batch_size: int=1_000_000
-                         ) -> Iterable[Tuple[NDArray, list[U], list[I]]]:
-        n_data = count_polars(data)
-        n_val = count_polars(val)
-
-        data_bar = tqdm(total=ceil(n_data / users_batch_size), position=0, desc="data")
-        val_bar = tqdm(total=ceil(n_val / items_batch_size), position=1, desc="val")
+    def _score_generator(self, users_batch_size: int, items_batch_size: int) -> Iterable[Tuple[NDArray, list[U], list[I]]]:
+        data_bar = tqdm(total=ceil(self.trainer.data_count / users_batch_size), position=0, desc="data")
+        pred_bar = tqdm(total=ceil(self.trainer.test_count / items_batch_size), position=1, desc="predict")
 
         data_bar.reset()
-        for data_batch in data.collect_batches(chunk_size=users_batch_size):
+        for data_batch in self.trainer.data.collect_batches(chunk_size=users_batch_size):
             users = data_batch[USER].to_list()
 
-            user_embeddings = model.process_data_batch(data_batch, items_df=items_df, items_batch_size=items_batch_size)
+            user_embeddings = self.trainer.model.process_data_batch(data_batch, items_df=self.trainer.items_df, mode='predict')
             user_norms = np.linalg.norm(user_embeddings, axis=1, keepdims=True)
             user_norms[user_norms == 0] = 1e-12
 
-            val_bar.reset()
+            pred_bar.reset()
             items, similarity_blocks = [], []
-            for val_batch in val.collect_batches(chunk_size=items_batch_size):
-                val_items_batch = val_batch[ITEM].to_list()
-                items.extend(val_items_batch)
+            for pred_batch in self.trainer.test.collect_batches(chunk_size=items_batch_size):
+                pred_items_batch = pred_batch[ITEM].to_list()
+                items.extend(pred_items_batch)
 
-                val_items_df_batch = items_df.filter(pl.col(ITEM).is_in(val_items_batch)).select([ITEM, EMBEDDING]).collect()
-                val_item_to_emb = {r[0]: np.asarray(r[1], dtype=np.float64) for r in val_items_df_batch.rows()}
+                pred_item_to_emb = build_embeddings_map(self.trainer.items_df, pred_items_batch)
 
-                item_embeddings = np.vstack([val_item_to_emb[it] for it in val_items_batch])  # (n_val_batch, d)
+                item_embeddings = np.vstack([pred_item_to_emb[it] for it in pred_items_batch])  # (n_pred_batch, d)
                 item_norms = np.linalg.norm(item_embeddings, axis=1, keepdims=True)
                 item_norms[item_norms == 0] = 1e-12
 
-                similarity = (item_embeddings @ user_embeddings.T) / (item_norms * user_norms.T)  # (n_val_batch, n_users_batch)
+                similarity = (item_embeddings @ user_embeddings.T) / (item_norms * user_norms.T)  # (n_pred_batch, n_users_batch)
                 similarity_blocks.append(similarity.T)
 
-                val_bar.update(1)
+                pred_bar.update(1)
             data_bar.update(1)
             yield np.hstack(similarity_blocks), users, items
 
@@ -191,10 +164,7 @@ class Solver(Generic[I, U]):
         """
         Solve assignment on the reduced candidate graph.
 
-        Returns
-        -------
-        assignments : dict
-          item_id -> list of (user_id, score), length K for each item (if feasible)
+        :return: item_id -> list[K] of (user_id, score)
         """
         # Build candidate list edges: (item, user, score)
         edges = []
@@ -219,11 +189,7 @@ class Solver(Generic[I, U]):
                 " Increase R or collect more candidate users per item (increase L)."
             )
 
-        # If OR-Tools is available and requested, use min-cost flow
-        if self.use_ortools:
-            return self._solve_with_ortools(items, users, edges, item_to_idx, user_to_idx)
-        else:
-            raise NotImplementedError()
+        return self._solve_with_ortools(items, users, edges, item_to_idx, user_to_idx)
 
     def _solve_with_ortools(self, items, users, edges, item_to_idx, user_to_idx):
         # Build min-cost flow graph with nodes:

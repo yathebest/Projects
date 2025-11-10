@@ -1,71 +1,62 @@
-from typing import Literal
+from typing import Literal, Union
+from numpy.typing import NDArray
 
 import numpy as np
 import polars as pl
-from numpy.typing import NDArray
+import torch
+from torch.nn.utils.rnn import pad_sequence
+from torch import Tensor
 
+from .BaseRecurrentModel import BaseRecurrentModel
 from .constants import *
+from .utils import build_embedding_sequences
 
 
-class WeightedAvgModel:
+class WeightedAvgModel(BaseRecurrentModel):
     """
-    :param method: 'mul' or 'add'
+    :param method: 'add' or 'mul'
     :param temporal_distribution: distribution of weights applied to temporal indices
     :param alpha: for 'add' method - weight of temporal component
     :param temp: for 'exp' temporal_distribution - multiplier in exp
     """
 
-    def __init__(self, method: Literal['mul', 'add'] = 'mul',
+    def __init__(self, method: Literal['add', 'mul'] = 'add',
                  temporal_distribution: Literal['linear', 'exp', 'uni'] = 'linear',
                  alpha: float = 0.5, temp: float = 0.1):
+        super().__init__(trainable=False)
         self.method = method
         self.temporal_distribution = temporal_distribution
         self.alpha = alpha
         self.temp = temp
 
-    def process_data_batch(self, data_batch: pl.DataFrame, items_df: pl.LazyFrame, items_batch_size):
-        users_batch_size = len(data_batch)
-        item_lists = data_batch[ITEM].to_list()  # list of lists
+    def process_data_batch(self, data_batch: pl.DataFrame, items_df: pl.LazyFrame,
+                           mode: Literal['train', 'val', 'predict'] = 'train') -> Union[NDArray, Tensor]:
+        device = next(self.parameters()).device if any(p.numel() for p in self.parameters()) else torch.device('cpu')
+
+        item_lists = data_batch[ITEM].to_list()
         time_index_lists = data_batch[TIME_INDEX].to_list()
         target_lists = data_batch[TARGET].to_list()
 
-        seen = set()
-        data_items_list = []
-        user_item_weights = []
-        for row_items, row_time, row_target in zip(item_lists, time_index_lists, target_lists):
-            weights = self._get_weights(row_time, row_target)
-            items_weights = []
-            for it, w in zip(row_items, weights):
-                if it not in seen:
-                    seen.add(it)
-                    data_items_list.append(it)
-                items_weights.append((it, float(w)))
-            user_item_weights.append(items_weights)
+        input = build_embedding_sequences(items_df, item_lists, device)  # (L, B, D)
 
-        embeddings = None
-        for start in range(0, len(data_items_list), items_batch_size):
-            chunk = data_items_list[start:start + items_batch_size]
+        weights = pad_sequence([  # (L, B)
+            torch.from_numpy(self._get_weights(row_time, row_target))
+            for row_time, row_target in zip(time_index_lists, target_lists)
+        ], batch_first=False, padding_value=0.0).to(dtype=torch.float32, device=device)
 
-            items_batch_df = items_df.filter(pl.col(ITEM).is_in(chunk)).select([ITEM, EMBEDDING]).collect()
-            chunk_map = {r[0]: np.asarray(r[1], dtype=np.float64) for r in items_batch_df.rows()}
+        out = (weights.unsqueeze(-1) * input) # (L, B, D)
 
-            if embeddings is None:
-                d = next(iter(chunk_map.values())).shape[0]
-                embeddings = np.zeros((users_batch_size, d), dtype=np.float64)
-
-            for ui, items_weights in enumerate(user_item_weights):
-                acc = embeddings[ui]
-                for it, w in items_weights:
-                    emb = chunk_map.get(it)
-                    if emb is not None:
-                        acc += w * emb
-        return embeddings
+        if mode in ['train', 'val']:
+            return torch.stack([
+                out[:t].sum(dim=0)  # (B, D)
+                for t in range(1, out.shape[0]+1)
+            ]) # (L, B, D)
+        elif mode == 'predict':
+            return out.sum(dim=0).detach().cpu().numpy().astype(np.float32)  # (B, D)
+        else:
+            raise NotImplementedError()
 
     def _get_weights(self, indices: NDArray, ranks: NDArray) -> NDArray:
-        """
-        :param indices: array-like, temporal indices (only order matters)
-        :param ranks: array-like, ranks magnitude (only magnitude matters)
-        """
         indices = np.asarray(indices)
         ranks = np.asarray(ranks, dtype=float)
         if indices.shape != ranks.shape:

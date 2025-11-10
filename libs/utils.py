@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
 import polars as pl
+import torch
+from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
 
 from .constants import *
 
@@ -63,5 +66,30 @@ def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     dcg = df.apply(calculate_dcg, axis=1).mean()
     return dcg
 
-def count_polars(df: pl.LazyFrame | pl.DataFrame):
+def count_polars(df: pl.LazyFrame | pl.DataFrame | None):
+    if df is None:
+        return None
     return df.select(pl.len()).collect().item()
+
+def build_embeddings_map(items_df: pl.LazyFrame, items: list | set) -> dict:
+    """
+    :return: mapping ITEM -> EMBEDDING
+    """
+    df = items_df.filter(pl.col(ITEM).is_in(list(items))).select([ITEM, EMBEDDING]).collect()
+    return {r[0]: np.asarray(r[1], dtype=np.float32) for r in df.rows()}
+
+def build_sequences_from_map(mapping: dict, item_lists: list[list], device: torch.device = torch.device('cpu')) -> Tensor:
+    """
+    :return: Tensor of shape (L, B, D)
+    """
+    return pad_sequence([
+        torch.from_numpy(np.stack([mapping[it] for it in item_list]))
+        for item_list in item_lists
+    ], padding_value=0.0, batch_first=False).to(dtype=torch.float32, device=device)
+
+def build_embedding_sequences(items_df: pl.LazyFrame, item_lists: list[list], device: torch.device = torch.device('cpu')) -> Tensor:
+    """
+    :return: Tensor of shape (L, B, D)
+    """
+    mapping = build_embeddings_map(items_df, set().union(*item_lists))
+    return build_sequences_from_map(mapping, item_lists, device)
