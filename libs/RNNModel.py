@@ -14,16 +14,17 @@ from .utils import build_embedding_sequences
 
 class RNNModel(BaseRecurrentModel):
     def __init__(self,
-                 item_embeddings_dim: int,
+                 in_dim: int,
+                 out_dim: Optional[int] = None,
                  hidden_dim: int = 64,
                  num_layers: int = 1,
                  dropout: float = 0.0,
                  layer: Literal['lstm', 'gru', 'rnn'] = 'lstm'):
         super().__init__(trainable=True)
 
-        self.in_dim = item_embeddings_dim
-        self.out_dim = item_embeddings_dim
-        self.hidden_dim = hidden_dim
+        self.in_dim = in_dim  # I
+        self.out_dim = in_dim if out_dim is None else out_dim  # O
+        self.hidden_dim = hidden_dim  # H
         self.num_layers = num_layers
         self.layer_type = layer
         self.dropout = dropout
@@ -69,20 +70,22 @@ class RNNModel(BaseRecurrentModel):
             return self.forward(input, return_hidden=False)
 
         if mode == 'train':
-            outputs = _run()  # (L, B, D)
+            outputs = _run()  # (L, B, O)
             return outputs
 
         elif mode == 'val' or mode == 'predict':
             prev_train = self.training
             self.eval()
             with torch.no_grad():
-                outputs = _run()  # (L, B, D)
+                outputs = _run()  # (L, B, O)
             self.train(prev_train)
 
             if mode == 'val':
-                return outputs  # (L, B, D)
+                return outputs  # (L, B, O)
             else:
-                return outputs[-1].detach().cpu().numpy().astype(np.float32) # (B, D)
+                lengths = torch.tensor([len(l) for l in item_lists])  # B
+                batch_indices = torch.arange(outputs.shape[1])  # B
+                return outputs[lengths-1, batch_indices].detach().cpu().numpy().astype(np.float32) # (B, O)
 
         else:
             raise NotImplementedError()
