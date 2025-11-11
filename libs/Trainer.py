@@ -112,8 +112,11 @@ class Trainer:
         for data_batch in dataiter:
 
             predict = self.model.process_data_batch(data_batch, items_df=self.items_df, mode='train')
+            predict = predict[:-1]
 
             target, mask = self._build_target_with_mask(data_batch[ITEM].to_list())
+            target, mask = target[1:], mask[1:]
+
             batch_loss = self._compute_loss(predict, target, mask)
 
             optimizer.zero_grad()
@@ -149,8 +152,11 @@ class Trainer:
             for data_batch in dataiter:
 
                 predict = self.model.process_data_batch(data_batch, items_df=self.items_df, mode='val')
+                predict = predict[:-1]
 
                 target, mask = self._build_target_with_mask(data_batch[ITEM].to_list())
+                target, mask = target[1:], mask[1:]
+
                 batch_loss = self._compute_loss(predict, target, mask)
 
                 running_loss += float(batch_loss.cpu().item())
