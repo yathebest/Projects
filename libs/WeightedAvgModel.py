@@ -37,22 +37,21 @@ class WeightedAvgModel(BaseRecurrentModel):
         time_index_lists = data_batch[TIME_INDEX].to_list()
         target_lists = data_batch[TARGET].to_list()
 
-        input = build_embedding_sequences(items_df, item_lists, device)  # (L, B, D)
+        inputs = build_embedding_sequences(items_df, item_lists, device)  # (T, B, D)
 
-        weights = pad_sequence([  # (L, B)
+        weights = pad_sequence([  # (T, B)
             torch.from_numpy(self._get_weights(row_time, row_target))
             for row_time, row_target in zip(time_index_lists, target_lists)
         ], batch_first=False, padding_value=0.0).to(dtype=torch.float32, device=device)
 
-        out = (weights.unsqueeze(-1) * input) # (L, B, D)
+        out = (weights.unsqueeze(-1) * inputs) # (T, B, D)
 
         if mode in ['train', 'val']:
-            return torch.stack([
-                out[:t].sum(dim=0)  # (B, D)
-                for t in range(1, out.shape[0]+1)
-            ]) # (L, B, D)
+            raise NotImplementedError()
+
         elif mode == 'predict':
             return out.sum(dim=0).detach().cpu().numpy().astype(np.float32)  # (B, D)
+
         else:
             raise NotImplementedError()
 

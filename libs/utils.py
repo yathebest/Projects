@@ -3,6 +3,7 @@ import pandas as pd
 import polars as pl
 import torch
 from torch import Tensor
+from torch.nn import Module
 from torch.nn.utils.rnn import pad_sequence
 
 from .constants import *
@@ -78,18 +79,40 @@ def build_embeddings_map(items_df: pl.LazyFrame, items: list | set) -> dict:
     df = items_df.filter(pl.col(ITEM).is_in(list(items))).select([ITEM, EMBEDDING]).collect()
     return {r[0]: np.asarray(r[1], dtype=np.float32) for r in df.rows()}
 
-def build_sequences_from_map(mapping: dict, item_lists: list[list], device: torch.device = torch.device('cpu')) -> Tensor:
+def build_sequences_from_map(mapping: dict, item_lists: list[list],
+                             device: torch.device = torch.device('cpu'), batch_first: bool = False) -> Tensor:
     """
-    :return: Tensor of shape (L, B, D)
+    :return: Tensor (T, B, D) or (B, T, D)
     """
     return pad_sequence([
         torch.from_numpy(np.stack([mapping[it] for it in item_list]))
         for item_list in item_lists
-    ], padding_value=0.0, batch_first=False).to(dtype=torch.float32, device=device)
+    ], padding_value=0.0, batch_first=batch_first).to(dtype=torch.float32, device=device)
 
-def build_embedding_sequences(items_df: pl.LazyFrame, item_lists: list[list], device: torch.device = torch.device('cpu')) -> Tensor:
+def build_embedding_sequences(items_df: pl.LazyFrame, item_lists: list[list],
+                              device: torch.device = torch.device('cpu'), batch_first: bool = False) -> Tensor:
     """
-    :return: Tensor of shape (L, B, D)
+    :return: Tensor (T, B, D) or (B, T, D)
     """
     mapping = build_embeddings_map(items_df, set().union(*item_lists))
-    return build_sequences_from_map(mapping, item_lists, device)
+    return build_sequences_from_map(mapping, item_lists, device=device, batch_first=batch_first)
+
+def build_mask(item_lists: list[list], device: torch.device = torch.device('cpu'), batch_first: bool = False):
+    """
+    :return: Bool Tensor (T, B) or (B, T)
+    """
+    lengths = torch.tensor([len(l) for l in item_lists])
+    indices = torch.arange(lengths.max().item())
+    mask = (indices.unsqueeze(0) < lengths.unsqueeze(1)).transpose(0, 1).to(device=device)
+    if batch_first:
+        return mask.t()
+    return mask
+
+def count_params(model: Module) -> int:
+    pp=0
+    for p in list(model.parameters()):
+        nn=1
+        for s in list(p.size()):
+            nn = nn*s
+        pp += nn
+    return pp

@@ -1,18 +1,18 @@
+from copy import deepcopy
 from math import ceil
 from typing import Optional, Literal
 
 import numpy as np
 import polars as pl
-from torch import Tensor
-from tqdm.auto import tqdm, trange
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 from torch.optim import Optimizer, AdamW
-from copy import deepcopy
+from tqdm.auto import tqdm
 
 from .BaseRecurrentModel import BaseRecurrentModel
-from .utils import count_polars, build_embedding_sequences
 from .constants import *
+from .utils import count_polars, build_mask, build_embeddings_map, build_sequences_from_map
 
 
 class Trainer:
@@ -21,6 +21,9 @@ class Trainer:
     :param train_interactions: LazyFrame containing train interactions with columns [USER, ITEM, TARGET, TIME_INDEX]
     :param predict_items: LazyFrame containing items to predict users for with columns [ITEM]
     :param items_metadata: LazyFrame containing all items metadata with columns [ITEM, EMBEDDING]
+    :param loss_type: type of loss function to use
+    :param loss_margin: used for margin-based losses (with negative samples)
+    :param negative_ratio: used to sample negatives. If provided margin-based loss will be used
     :param num_recent_videos: number of known the most recent interactions to keep for each user
     :param val_ratio: ratio for temporal splitting interactions into train/val
     """
@@ -28,7 +31,8 @@ class Trainer:
                  train_interactions: pl.LazyFrame, predict_items: pl.LazyFrame,
                  items_metadata: pl.LazyFrame,
                  num_recent_videos: int = 500, val_ratio: float = 0.0,
-                 loss_type: Literal['mse', 'cos'] = 'mse',
+                 loss_type: Literal['mse', 'cos'] = 'mse', loss_margin: float = 0.0,
+                 negative_ratio: int = 0,
                  device: torch.device = torch.device('cpu')
                  ):
         self.model = model.to(device)
@@ -36,6 +40,8 @@ class Trainer:
         self.items_df = items_metadata
         self.val_ratio = val_ratio
         self.loss_type = loss_type
+        self.loss_margin = loss_margin
+        self.negative_ratio = negative_ratio
         self.device = device
         self.history = None
 
@@ -67,31 +73,117 @@ class Trainer:
         self.test_count = count_polars(self.test)
         print(f"All: {self.data_count} Train: {self.train_count} Val: {self.val_count} Test: {self.test_count}")
 
-    def _build_target_with_mask(self, item_lists: list[list]) -> tuple[Tensor, Tensor]:
-        target_tensor = build_embedding_sequences(self.items_df, item_lists, self.device)
+    def _build_target(self, item_lists: list[list]) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+        mapping = build_embeddings_map(self.items_df, set().union(*item_lists))
+        target_tensor = build_sequences_from_map(mapping, item_lists, self.device)
+        mask = build_mask(item_lists, self.device)
 
-        lengths = torch.tensor([len(l) for l in item_lists])
-        indices = torch.arange(lengths.max().item())
-        mask = (indices.unsqueeze(0) < lengths.unsqueeze(1)).transpose(0, 1).to(device=self.device)
+        negatives = self._sample_negatives(mapping, item_lists) if self.negative_ratio > 0 else None
 
-        return target_tensor, mask
+        return target_tensor, mask, negatives
 
-    def _compute_loss(self, predict: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-        if self.loss_type == 'mse':
-            diff = predict - target  # (L, B, D)
-            sq = diff.pow(2).sum(dim=2)  # (L, B)
-            masked_sq_sum = sq[mask].sum()
-            emb_dim = predict.shape[2]
-            denom = float(mask.sum().item() * emb_dim)
-            return masked_sq_sum / denom
+    def _sample_negatives(self, embeddings_mapping: dict, item_lists: list[list]):
+        """
+        :returns: Tensor of shape (T, B, K, D)
+        """
+        B = len(item_lists)
+        T = max((len(s) for s in item_lists), default=0)
+        K = self.negative_ratio
 
-        elif self.loss_type == 'cos':
-            out_n = F.normalize(predict, p=2, dim=2)
-            tgt_n = F.normalize(target, p=2, dim=2)
-            cos = (out_n * tgt_n).sum(dim=2)  # (L, B)
-            cos = torch.clamp(cos, -1.0, 1.0)
-            per_pos = (1.0 - cos)[mask]
-            return per_pos.mean()
+        unique_items = list(set().union(*item_lists))
+        M = len(unique_items)
+
+        id2idx = {it: idx for idx, it in enumerate(unique_items)}
+
+        emb_list = [torch.from_numpy(embeddings_mapping[it]).to(self.device).float() for it in unique_items]
+        emb_matrix = torch.stack(emb_list, dim=0)  # (M, D)
+
+        mask_allowed = torch.ones((B, M), dtype=torch.bool, device=self.device)
+        for b, lst in enumerate(item_lists):
+            for it in lst:
+                idx = id2idx.get(it)
+                if idx is not None:
+                    mask_allowed[b, idx] = False
+
+        cand_counts = mask_allowed.sum(dim=1)  # (B,)
+        valid_users_mask = cand_counts > 0
+        valid_users = valid_users_mask.nonzero(as_tuple=False).squeeze(1)
+
+        enough_mask = cand_counts[valid_users] >= K
+        users_enough = valid_users[enough_mask]
+        users_not_enough = valid_users[~enough_mask]
+
+        def sample_for_users(user_idx_tensor, replacement: bool):
+            """
+            Returns indices tensor of shape (T, len(user_idx_tensor), K) with sampled local item indices.
+            """
+            if user_idx_tensor.numel() == 0:
+                return None
+
+            weights = mask_allowed[user_idx_tensor].float()
+            weights_rep = weights.repeat_interleave(T, dim=0)
+            sampled = torch.multinomial(weights_rep, num_samples=K, replacement=replacement)
+            sampled = sampled.view(T, user_idx_tensor.numel(), K)
+            return sampled
+
+        idxs_enough = sample_for_users(users_enough, replacement=False)
+        idxs_not_enough = sample_for_users(users_not_enough, replacement=True)
+
+        idxs_all = torch.full((T, B, K), -1, dtype=torch.long, device=self.device)
+        if idxs_enough is not None:
+            idxs_all[:, users_enough, :] = idxs_enough
+        if idxs_not_enough is not None:
+            idxs_all[:, users_not_enough, :] = idxs_not_enough
+
+        idxs_clamped = idxs_all.clamp(min=0)  # (T, B, K)
+        neg_emb = emb_matrix[idxs_clamped]  # (T, B, K, D)
+        neg_emb[idxs_all < 0] = 0.0
+
+        return neg_emb  # (T, B, K, D)
+
+    def _compute_loss(self, predict: Tensor, target: Tensor, mask: Tensor, negative: Optional[Tensor] = None) -> Tensor:
+        """
+        :param predict: (T, B, D)
+        :param target: (T, B, D)
+        :param mask: (T, B) boolean
+        :param negative: optional (T, B, K, D) K negative samples per position.
+        """
+
+        if self.loss_type == 'mse':  # MSELoss | MarginMSELoss
+            diff = predict - target  # (T, B, D)
+            sq_pos = diff.pow(2).sum(dim=2)  # (T, B)
+
+            if negative is None:  # MSELoss
+                masked_sq_sum = sq_pos[mask].sum()
+                emb_dim = predict.shape[2]
+                denom = float(mask.sum().item() * emb_dim) if mask.sum().item() > 0 else 1.0
+                return masked_sq_sum / denom
+            else:  # MarginMSELoss
+                sq_neg_all = (predict.unsqueeze(2) - negative).pow(2).sum(dim=3)  # (T, B, K, D) -> (T, B, K)
+                sq_neg, _ = sq_neg_all.min(dim=2)  # (T, B)
+
+                hinge = F.relu(self.loss_margin + sq_pos - sq_neg)  # (T, B)
+                return hinge[mask].mean()
+
+        elif self.loss_type == 'cos':  # CosineEmbeddingLoss | MarginCosineEmbeddingLoss
+            out_n = F.normalize(predict, p=2, dim=2)  # (T, B, D)
+            tgt_n = F.normalize(target, p=2, dim=2)  # (T, B, D)
+            cos_pos = (out_n * tgt_n).sum(dim=2)  # (T, B)
+            cos_pos = torch.clamp(cos_pos, -1.0, 1.0)
+
+            if negative is None:  # CosineEmbeddingLoss
+                per_pos = (1.0 - cos_pos)[mask]
+                return per_pos.mean()
+            else:
+                neg_n = negative.view(-1, negative.shape[2], negative.shape[3])  # (T, B, K, D) -> (TxB, K, D)
+                neg_n = F.normalize(neg_n, p=2, dim=2).view(negative.shape)  # (TxB, K, D) -> (T, B, K, D)
+                out_expand = out_n.unsqueeze(2)  # (T, B, 1, D)
+                cos_neg_all = (out_expand * neg_n).sum(dim=3)  # (T, B, K)
+                cos_neg, _ = cos_neg_all.max(dim=2)  # (T, B)
+                cos_neg = torch.clamp(cos_neg, -1.0, 1.0)
+
+                hinge = F.relu(self.loss_margin + cos_neg - cos_pos)
+                return hinge[mask].mean()
 
         else:
             raise NotImplementedError()
@@ -114,10 +206,12 @@ class Trainer:
             predict = self.model.process_data_batch(data_batch, items_df=self.items_df, mode='train')
             predict = predict[:-1]
 
-            target, mask = self._build_target_with_mask(data_batch[ITEM].to_list())
+            target, mask, neg = self._build_target(data_batch[ITEM].to_list())
             target, mask = target[1:], mask[1:]
+            if neg is not None:
+                neg = neg[1:]
 
-            batch_loss = self._compute_loss(predict, target, mask)
+            batch_loss = self._compute_loss(predict, target, mask, neg)
 
             optimizer.zero_grad()
             batch_loss.backward()
@@ -154,10 +248,12 @@ class Trainer:
                 predict = self.model.process_data_batch(data_batch, items_df=self.items_df, mode='val')
                 predict = predict[:-1]
 
-                target, mask = self._build_target_with_mask(data_batch[ITEM].to_list())
+                target, mask, neg = self._build_target(data_batch[ITEM].to_list())
                 target, mask = target[1:], mask[1:]
+                if neg is not None:
+                    neg = neg[1:]
 
-                batch_loss = self._compute_loss(predict, target, mask)
+                batch_loss = self._compute_loss(predict, target, mask, neg)
 
                 running_loss += float(batch_loss.cpu().item())
                 processed_batches += 1

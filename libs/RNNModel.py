@@ -51,6 +51,12 @@ class RNNModel(BaseRecurrentModel):
             self.proj = nn.Identity()
 
     def forward(self, x: Tensor, hidden: Optional[Tuple[Tensor, Tensor] | Tensor] = None, return_hidden: bool = False):
+        """
+         :param x: Tensor (T, B, I)
+         :param hidden: bool Tensor (B, T) where True = padding
+         :param return_hidden: return hidden state
+         :returns: Tensor (T, B, O) or Tuple[Tensor (T, B, O), None] [t+1]
+         """
         if hidden:
             out, hid = self.rnn(x, hidden)
         else:
@@ -70,21 +76,21 @@ class RNNModel(BaseRecurrentModel):
             return self.forward(input, return_hidden=False)
 
         if mode == 'train':
-            outputs = _run()  # (L, B, O)
+            outputs = _run()  # (T, B, O)
             return outputs
 
         elif mode == 'val' or mode == 'predict':
             prev_train = self.training
             self.eval()
             with torch.no_grad():
-                outputs = _run()  # (L, B, O)
+                outputs = _run()  # (T, B, O)
             self.train(prev_train)
 
             if mode == 'val':
-                return outputs  # (L, B, O)
+                return outputs  # (T, B, O)
             else:
-                lengths = torch.tensor([len(l) for l in item_lists])  # B
-                batch_indices = torch.arange(outputs.shape[1])  # B
+                lengths = torch.tensor([len(l) for l in item_lists], device=device)  # B
+                batch_indices = torch.arange(outputs.shape[1], device=device)  # B
                 return outputs[lengths-1, batch_indices].detach().cpu().numpy().astype(np.float32) # (B, O)
 
         else:
