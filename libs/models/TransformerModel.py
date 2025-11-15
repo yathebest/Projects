@@ -8,8 +8,8 @@ from numpy.typing import NDArray
 from torch import Tensor
 
 from .BaseRecurrentModel import BaseRecurrentModel
-from .constants import *
-from .utils import build_embedding_sequences, build_mask
+from libs.constants import *
+from libs.utils import build_embedding_sequences, build_mask
 
 
 class TransformerModel(BaseRecurrentModel):
@@ -62,7 +62,8 @@ class TransformerModel(BaseRecurrentModel):
         else:
             self.proj = nn.Identity()
 
-    def _create_sinusoidal_embeddings(self, max_len: int, dim: int) -> nn.Embedding:
+    @staticmethod
+    def _create_sinusoidal_embeddings(max_len: int, dim: int) -> nn.Embedding:
         pe = torch.zeros(max_len, dim)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, dim, 2).float() * (-np.log(10000.0) / dim))
@@ -79,9 +80,11 @@ class TransformerModel(BaseRecurrentModel):
         mask = torch.triu(torch.ones((size, size), dtype=torch.bool, device=device), diagonal=1)
         return mask
 
-    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None):
+    def forward(self, x: Tensor, src_mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None):
         """
         :param x: Tensor (B, T, I)
+        :param src_mask: optional bool Tensor (T, T) or (BxNHead, T, T)
         :param src_key_padding_mask: optional bool Tensor (B, T) where True = padding
         :returns: Tensor (B, T, O)
         """
@@ -102,7 +105,6 @@ class TransformerModel(BaseRecurrentModel):
         else:
             x_emb = x_proj + pos_emb  # (B, T, H)
 
-        src_mask = self._causal_mask(T, device=device)  # (T, T)
         out = self.transformer(x_emb, mask=src_mask, src_key_padding_mask=src_key_padding_mask)  # (B, T, H)
 
         out = self.proj(out)  # (B, T, O)
@@ -117,7 +119,8 @@ class TransformerModel(BaseRecurrentModel):
         def _run() -> Tensor:
             inputs = build_embedding_sequences(items_df, item_lists, batch_first=True, device=device)  # (B, T, I)
             key_padding_mask = ~build_mask(item_lists, batch_first=True, device=device)  # (B, T) True for padding
-            out = self.forward(inputs, src_key_padding_mask=key_padding_mask)  # (B, T, O)
+            src_mask = self._causal_mask(inputs.shape[1], device=device)  # (T, T)
+            out = self.forward(inputs, src_mask=src_mask, src_key_padding_mask=key_padding_mask)  # (B, T, O)
 
             return out.permute(1, 0, 2)   # (T, B, O)
 

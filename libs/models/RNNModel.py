@@ -8,8 +8,8 @@ import torch.nn as nn
 from torch import Tensor
 
 from .BaseRecurrentModel import BaseRecurrentModel
-from .constants import *
-from .utils import build_embedding_sequences
+from libs.constants import *
+from libs.utils import build_embedding_sequences
 
 
 class RNNModel(BaseRecurrentModel):

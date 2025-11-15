@@ -8,8 +8,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch import Tensor
 
 from .BaseRecurrentModel import BaseRecurrentModel
-from .constants import *
-from .utils import build_embedding_sequences
+from libs.constants import *
+from libs.utils import build_embedding_sequences
 
 
 class WeightedAvgModel(BaseRecurrentModel):
@@ -46,11 +46,19 @@ class WeightedAvgModel(BaseRecurrentModel):
 
         out = (weights.unsqueeze(-1) * inputs) # (T, B, D)
 
-        if mode in ['train', 'val']:
+        if mode == 'train':
             raise NotImplementedError()
 
+        elif mode ==  'val':
+            with torch.no_grad():
+                return torch.stack([
+                    out[:i].sum(dim=0)
+                    for i in range(1, out.shape[0]+1)
+                ]) # (T, B, D)
+
         elif mode == 'predict':
-            return out.sum(dim=0).detach().cpu().numpy().astype(np.float32)  # (B, D)
+            with torch.no_grad():
+                return out.sum(dim=0).detach().cpu().numpy().astype(np.float32)  # (B, D)
 
         else:
             raise NotImplementedError()

@@ -1,4 +1,4 @@
 .idea/
 VK-LSVD/
 *.iml
-models/
+/checkpoints/

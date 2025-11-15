@@ -48,17 +48,21 @@ class Solver(Generic[I, U]):
 
         self.predict_count = count_polars(self.predict_items)
 
-    def collect_candidates(self, users_batch_size: int=1_000_000, items_batch_size: int=1_000_000):
+    def collect_candidates(self, users_batch_size: int=1_000_000, items_batch_size: int=1_000_000, train_data_only: bool = False):
         """
         :param users_batch_size: batching for users
         :param items_batch_size: batching for items
+        :param train_data_only: if True, only train data will be used to for predict
         """
         users_bar = tqdm(total=ceil(self.trainer.data_count / users_batch_size), position=0, desc="Users")
-        score_items_bar = tqdm(total=ceil(self.predict_count), position=1, desc="Score Items")
 
         score_gen = self._score_generator(users_batch_size, items_batch_size)
         for batch_scores, users, items in score_gen:
-            score_items_bar.reset()
+            n_users = batch_scores.shape[0]
+
+            top_n = min(self.L, n_users)
+            top_k_indices = np.argpartition(-batch_scores, kth=top_n - 1, axis=0)[:top_n, :]
+
             for col_idx, item in enumerate(items):
                 mapping = self._item_to_user_score.get(item)
                 if mapping is None:
@@ -66,27 +70,30 @@ class Solver(Generic[I, U]):
                     self._item_to_user_score[item] = mapping
                     self._item_heaps[item] = []
 
-                heap = self._item_heaps[item]
-                col_scores = batch_scores[:, col_idx]
-                for row_idx, user in enumerate(users):
-                    s = float(col_scores[row_idx])
+                indices = top_k_indices[:, col_idx]
+                scores = batch_scores[indices, col_idx]
+
+                for u_idx, s in zip(indices.tolist(), scores.tolist()):
+                    user = users[u_idx]
+                    s = float(s)
                     prev = mapping.get(user)
-                    if prev is None:
-                        if len(mapping) < self.L:
-                            mapping[user] = s
-                            heapq.heappush(heap, (s, user))
-                        else:
-                            if heap and s > heap[0][0]:
-                                mapping[user] = s
-                                heapq.heappush(heap, (s, user))
-                                self._evict_until_within_L(item)
-                    else:
-                        if s > prev:
-                            mapping[user] = s
-                            heapq.heappush(heap, (s, user))
-                            if len(mapping) > self.L:
-                                self._evict_until_within_L(item)
-                score_items_bar.update(1)
+                    if prev is None or s > prev:
+                        mapping[user] = s
+
+                if len(mapping) > self.L:
+                    map_users = list(mapping.keys())
+                    map_scores = np.array([mapping[u] for u in map_users], dtype=float)
+
+                    kth = max(0, len(map_scores) - self.L)
+                    top_indices = np.argpartition(-map_scores, self.L - 1)[:self.L]
+                    kept_users = [map_users[i] for i in top_indices]
+                    kept_scores = map_scores[top_indices]
+                    new_mapping = {u: float(s) for u, s in zip(kept_users, kept_scores)}
+                    self._item_to_user_score[item] = new_mapping
+                    new_heap = [(s, u) for u, s in new_mapping.items()]
+                    heapq.heapify(new_heap)
+                    self._item_heaps[item] = new_heap
+
             users_bar.update(1)
 
         for item in tqdm(list(self._item_to_user_score.keys()), desc="Clean up"):
@@ -101,7 +108,7 @@ class Solver(Generic[I, U]):
 
             user_embeddings = self.trainer.model.process_data_batch(data_batch, items_df=self.trainer.items_df, mode='predict')
             user_norms = np.linalg.norm(user_embeddings, axis=1, keepdims=True)
-            user_norms[user_norms == 0] = 1e-12
+            user_norms[user_norms == 0] = EPS
 
             items_bar.reset()
             items, similarity_blocks = [], []
@@ -114,7 +121,7 @@ class Solver(Generic[I, U]):
 
                 item_embeddings = np.vstack([pred_item_to_emb[it] for it in pred_items_batch])  # (n_pred_batch, d)
                 item_norms = np.linalg.norm(item_embeddings, axis=1, keepdims=True)
-                item_norms[item_norms == 0] = 1e-12
+                item_norms[item_norms == 0] = EPS
 
                 similarity = (item_embeddings @ user_embeddings.T) / (item_norms * user_norms.T)  # (n_pred_batch, n_users_batch)
                 similarity_blocks.append(similarity.T)
@@ -124,7 +131,7 @@ class Solver(Generic[I, U]):
 
     def get_reduced_edges(self) -> List[Tuple[I, U, float]]:
         """
-        Return list of (item, user, score) for current collected candidates.
+        :returns: edges - List of (ITEM, User, score) for current collected candidates
         """
         edges = []
         for item, umap in self._item_to_user_score.items():
@@ -149,7 +156,7 @@ class Solver(Generic[I, U]):
             if current is None:
                 continue
             # use a tolerant comparison
-            if abs(current - s_pop) < 1e-12:
+            if abs(current - s_pop) < EPS:
                 del mapping[u_pop]
             else:
                 # stale entry, continue popping
@@ -162,7 +169,7 @@ class Solver(Generic[I, U]):
         new_heap = []
         for s, u in heap:
             # only keep entries that match mapping
-            if u in mapping and abs(mapping[u] - s) < 1e-12:
+            if u in mapping and abs(mapping[u] - s) < EPS:
                 new_heap.append((s, u))
         heapq.heapify(new_heap)
         self._item_heaps[item] = new_heap
@@ -176,16 +183,8 @@ class Solver(Generic[I, U]):
 
         :return: item_id -> list[K] of (user_id, score) sorted by score descending
         """
-        # Build candidate list edges: (item, user, score)
-        edges = []
-        for item, user_map in self._item_to_user_score.items():
-            for user, score in user_map.items():
-                edges.append((item, user, score))
+        edges = self.get_reduced_edges()
 
-        if not edges:
-            return {}
-
-        # Unique node mappings
         items = sorted({e[0] for e in edges})
         users = sorted({e[1] for e in edges})
         item_to_idx = {it: idx for idx, it in enumerate(items)}
