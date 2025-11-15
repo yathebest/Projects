@@ -1,3 +1,5 @@
+from typing import Literal, Optional
+
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -9,9 +11,11 @@ from torch.nn.utils.rnn import pad_sequence
 from .constants import *
 
 
-def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
-    """submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
-    true_reactions is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List"""
+def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
+    """
+    :param submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
+    :param true_reactions is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List
+    """
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
     ).fillna({USER+'_pred': ""})
@@ -40,7 +44,11 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
     ndcg = df.apply(calculate_ndcg, axis=1).mean()
     return ndcg
 
-def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame):
+def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
+    """
+    :param submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
+    :param true_reactions is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List
+    """
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
     ).fillna({USER+'_pred': ""})
@@ -80,31 +88,45 @@ def build_embeddings_map(items_df: pl.LazyFrame, items: list | set) -> dict:
     return {r[0]: np.asarray(r[1], dtype=np.float32) for r in df.rows()}
 
 def build_sequences_from_map(mapping: dict, item_lists: list[list],
-                             device: torch.device = torch.device('cpu'), batch_first: bool = False) -> Tensor:
+                             batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
+                             device: torch.device | str = 'cpu') -> Tensor:
     """
-    :return: Tensor (T, B, D) or (B, T, D)
+    :return: Tensor (B, T, D) if batch_first else (T, B, D)
     """
     return pad_sequence([
         torch.from_numpy(np.stack([mapping[it] for it in item_list]))
         for item_list in item_lists
-    ], padding_value=0.0, batch_first=batch_first).to(dtype=torch.float32, device=device)
+    ], padding_value=0.0, batch_first=batch_first, padding_side=padding_side).to(dtype=torch.float32, device=device)
 
 def build_embedding_sequences(items_df: pl.LazyFrame, item_lists: list[list],
-                              device: torch.device = torch.device('cpu'), batch_first: bool = False) -> Tensor:
+                              batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
+                              device: torch.device | str = 'cpu') -> Tensor:
     """
-    :return: Tensor (T, B, D) or (B, T, D)
+    :return: Tensor (B, T, D) if batch_first else (T, B, D)
     """
     mapping = build_embeddings_map(items_df, set().union(*item_lists))
-    return build_sequences_from_map(mapping, item_lists, device=device, batch_first=batch_first)
+    return build_sequences_from_map(mapping, item_lists, device=device, batch_first=batch_first, padding_side=padding_side)
 
-def build_mask(item_lists: list[list], device: torch.device = torch.device('cpu'), batch_first: bool = False):
+def build_mask(item_lists: list[list],
+               batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
+               device: torch.device| str = 'cpu'):
     """
-    :return: Bool Tensor (T, B) or (B, T)
+    :return: Bool Tensor (B, T) if batch_first else (T, B)
     """
     lengths = torch.tensor([len(l) for l in item_lists])
-    indices = torch.arange(lengths.max().item())
-    mask = (indices.unsqueeze(0) < lengths.unsqueeze(1)).transpose(0, 1).to(device=device)
-    if batch_first:
+    max_len = lengths.max().item()
+    indices = torch.arange(max_len)
+
+    if padding_side == 'right':
+        mask = (indices.unsqueeze(0) < lengths.unsqueeze(1))
+    elif padding_side == 'left':
+        mask = (indices.unsqueeze(0) >= (max_len - lengths.unsqueeze(1)))
+    else:
+        raise NotImplementedError()
+
+    mask = mask.to(device=device)
+
+    if not batch_first:
         return mask.t()
     return mask
 
@@ -116,3 +138,18 @@ def count_params(model: Module) -> int:
             nn = nn*s
         pp += nn
     return pp
+
+def sample_polars(ldf: pl.LazyFrame , n_rows: Optional[int] = None, id_columns: Optional[list[str]] = None):
+    if n_rows is None:
+        return ldf
+
+    if id_columns is None:
+        id_columns = ldf.collect_schema().names()
+
+    lazy_with_hash = ldf.with_columns(
+        pl.concat_str(*id_columns).hash(seed=RANDOM_STATE).alias('_row_hash')
+    )
+
+    sampled = lazy_with_hash.sort('_row_hash').head(n_rows).drop('_row_hash')
+
+    return sampled

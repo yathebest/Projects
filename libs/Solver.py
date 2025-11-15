@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 
 from .Trainer import Trainer
 from .constants import *
-from .utils import build_embeddings_map
+from .utils import build_embeddings_map, count_polars
 
 U = TypeVar('U', bound=Hashable)
 I = TypeVar('I', bound=Hashable)
@@ -22,6 +22,7 @@ class Solver(Generic[I, U]):
         2) Solve reduced assignment with min-cost flow.
 
     :param trainer: model trainer with aggregated data
+    :param predict_items: LazyFrame containing items to predict users for with columns [ITEM]
     :param candidates_to_keep: Number of candidates to keep per item (memory/quality knob).
     :param top_per_item: Number of users to select per item.
     :param max_per_user: Max times a user can be assigned across all items.
@@ -29,10 +30,12 @@ class Solver(Generic[I, U]):
     """
 
     def __init__(self, trainer: Trainer,
+                 predict_items: pl.LazyFrame,
                  candidates_to_keep: int,
                  top_per_item: int = 100, max_per_user: int = 100,
                  score_scale: float = 1e6):
         self.trainer = trainer
+        self.predict_items = predict_items
         self.L = candidates_to_keep
         self.K = top_per_item
         self.R = max_per_user
@@ -43,13 +46,19 @@ class Solver(Generic[I, U]):
         # item -> heap of (score, user) used to evict smallest when > L
         self._item_heaps: Dict[I, List[Tuple[float, U]]] = {}
 
+        self.predict_count = count_polars(self.predict_items)
+
     def collect_candidates(self, users_batch_size: int=1_000_000, items_batch_size: int=1_000_000):
         """
         :param users_batch_size: batching for users
         :param items_batch_size: batching for items
         """
+        users_bar = tqdm(total=ceil(self.trainer.data_count / users_batch_size), position=0, desc="Users")
+        score_items_bar = tqdm(total=ceil(self.predict_count), position=1, desc="Score Items")
+
         score_gen = self._score_generator(users_batch_size, items_batch_size)
         for batch_scores, users, items in score_gen:
+            score_items_bar.reset()
             for col_idx, item in enumerate(items):
                 mapping = self._item_to_user_score.get(item)
                 if mapping is None:
@@ -77,25 +86,27 @@ class Solver(Generic[I, U]):
                             heapq.heappush(heap, (s, user))
                             if len(mapping) > self.L:
                                 self._evict_until_within_L(item)
+                score_items_bar.update(1)
+            users_bar.update(1)
 
-        for item in list(self._item_to_user_score.keys()):
+        for item in tqdm(list(self._item_to_user_score.keys()), desc="Clean up"):
             self._cleanup_item_heap(item)
 
     def _score_generator(self, users_batch_size: int, items_batch_size: int) -> Iterable[Tuple[NDArray, list[U], list[I]]]:
-        data_bar = tqdm(total=ceil(self.trainer.data_count / users_batch_size), position=0, desc="data")
-        pred_bar = tqdm(total=ceil(self.trainer.test_count / items_batch_size), position=1, desc="predict")
+        items_bar = tqdm(total=ceil(self.predict_count / items_batch_size), position=2, desc="Predict Items")
 
-        data_bar.reset()
-        for data_batch in self.trainer.data.collect_batches(chunk_size=users_batch_size):
+        users_iterable = self.trainer.data.collect_batches(chunk_size=users_batch_size)
+        for data_batch in users_iterable:
             users = data_batch[USER].to_list()
 
             user_embeddings = self.trainer.model.process_data_batch(data_batch, items_df=self.trainer.items_df, mode='predict')
             user_norms = np.linalg.norm(user_embeddings, axis=1, keepdims=True)
             user_norms[user_norms == 0] = 1e-12
 
-            pred_bar.reset()
+            items_bar.reset()
             items, similarity_blocks = [], []
-            for pred_batch in self.trainer.test.collect_batches(chunk_size=items_batch_size):
+            iterable = self.predict_items.collect_batches(chunk_size=items_batch_size)
+            for pred_batch in iterable:
                 pred_items_batch = pred_batch[ITEM].to_list()
                 items.extend(pred_items_batch)
 
@@ -108,8 +119,7 @@ class Solver(Generic[I, U]):
                 similarity = (item_embeddings @ user_embeddings.T) / (item_norms * user_norms.T)  # (n_pred_batch, n_users_batch)
                 similarity_blocks.append(similarity.T)
 
-                pred_bar.update(1)
-            data_bar.update(1)
+                items_bar.update(1)
             yield np.hstack(similarity_blocks), users, items
 
     def get_reduced_edges(self) -> List[Tuple[I, U, float]]:
@@ -164,7 +174,7 @@ class Solver(Generic[I, U]):
         """
         Solve assignment on the reduced candidate graph.
 
-        :return: item_id -> list[K] of (user_id, score)
+        :return: item_id -> list[K] of (user_id, score) sorted by score descending
         """
         # Build candidate list edges: (item, user, score)
         edges = []

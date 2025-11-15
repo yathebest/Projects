@@ -66,14 +66,13 @@ class RNNModel(BaseRecurrentModel):
         return (out, hid) if return_hidden else out
 
     def process_data_batch(self, data_batch: pl.DataFrame, items_df: pl.LazyFrame,
-                           mode: Literal['train', 'val', 'predict'] = 'train'
-                           ) -> Union[NDArray, Tensor]:
+                           mode: Literal['train', 'val', 'predict'] = 'train') -> Union[NDArray, Tensor]:
         device = next(self.parameters()).device if any(p.numel() for p in self.parameters()) else torch.device('cpu')
         item_lists = data_batch[ITEM].to_list()
 
         def _run() -> Tensor:
-            input = build_embedding_sequences(items_df, item_lists, device)
-            return self.forward(input, return_hidden=False)
+            inputs = build_embedding_sequences(items_df, item_lists, device=device)
+            return self.forward(inputs, return_hidden=False)
 
         if mode == 'train':
             outputs = _run()  # (T, B, O)
@@ -88,9 +87,11 @@ class RNNModel(BaseRecurrentModel):
 
             if mode == 'val':
                 return outputs  # (T, B, O)
+
             else:
                 lengths = torch.tensor([len(l) for l in item_lists], device=device)  # B
-                batch_indices = torch.arange(outputs.shape[1], device=device)  # B
+                batch_indices = torch.arange(len(item_lists), device=device)  # B
+
                 return outputs[lengths-1, batch_indices].detach().cpu().numpy().astype(np.float32) # (B, O)
 
         else:
