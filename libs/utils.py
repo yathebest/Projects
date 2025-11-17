@@ -1,4 +1,6 @@
-from typing import Literal, Optional
+import os
+from collections import defaultdict
+from typing import Literal, Optional, Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -16,6 +18,16 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
     :param submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
     :param true_reactions is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List
     """
+    count_users = defaultdict(int)
+    for user_list in submission[USER].iloc:
+        for user in user_list:
+            count_users[user] += 1
+
+    out_of_max = dict(filter(lambda x: x[1] > MAX_PER_USER, count_users.items()))
+    if len(out_of_max) > 0:
+        print(f"MAX_PER_USER constraint is not satisfied for {len(out_of_max)} users, "
+              f"they will not be considered for metric")
+
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
     ).fillna({USER+'_pred': ""})
@@ -33,11 +45,12 @@ def NDCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
             return 0.0
 
         dcg = 0.0
-        for i, user in enumerate(pred_users[:100]):
+        pred_users = [u for u in pred_users if u not in out_of_max]
+        for i, user in enumerate(pred_users[:TOP_PER_ITEM]):
             if user in true_users:
                 dcg += 1 / np.log2(i + 2)
 
-        idcg = (1 / np.log2(np.arange(min(len(true_users), 100)) + 2)).sum()
+        idcg = (1 / np.log2(np.arange(min(len(true_users), TOP_PER_ITEM)) + 2)).sum()
 
         return dcg / idcg if idcg > 0 else 0.0
 
@@ -49,6 +62,16 @@ def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
     :param submission is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List[100]
     :param true_reactions is DataFrame[nItems x 2] with columns (ITEM, USER), where USER is List
     """
+    count_users = defaultdict(int)
+    for user_list in submission[USER].iloc:
+        for user in user_list:
+            count_users[user] += 1
+
+    out_of_max = dict(filter(lambda x: x[1] > MAX_PER_USER, count_users.items()))
+    if len(out_of_max) > 0:
+        print(f"MAX_PER_USER constraint is not satisfied for {len(out_of_max)} users, "
+              f"they will not be considered for metric")
+
     df = submission.merge(
         true_reactions, on=ITEM, how='right', suffixes=["_pred", "_true"]
     ).fillna({USER+'_pred': ""})
@@ -66,7 +89,8 @@ def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
             return 0.0
 
         dcg = 0.0
-        for i, user in enumerate(pred_users[:100]):
+        pred_users = [u for u in pred_users if u not in out_of_max]
+        for i, user in enumerate(pred_users[:TOP_PER_ITEM]):
             if user in true_users:
                 dcg += 1 / np.log2(i + 2)
 
@@ -75,45 +99,60 @@ def DCG(submission: pd.DataFrame, true_reactions: pd.DataFrame) -> float:
     dcg = df.apply(calculate_dcg, axis=1).mean()
     return dcg
 
-def count_polars(df: pl.LazyFrame | pl.DataFrame | None):
-    if df is None:
-        return None
-    return df.select(pl.len()).collect().item()
-
-def build_embeddings_map(items_df: pl.LazyFrame, items: list | set) -> dict:
+def build_multimap(ldf: pl.LazyFrame, keys: Iterable,
+                   key_column: str = ITEM, value_columns: Iterable[str] = (EMBEDDING,)):
     """
-    :return: mapping ITEM -> EMBEDDING
+    :param ldf: LazyFrame from which items will be mapped
+    :param keys: keys to map
+    :param key_column: column to select as key from ldf
+    :param value_columns: columns to select as values from ldf
+    :return: mapping key -> value_column -> value
     """
-    df = items_df.filter(pl.col(ITEM).is_in(list(items))).select([ITEM, EMBEDDING]).collect()
-    return {r[0]: np.asarray(r[1], dtype=np.float32) for r in df.rows()}
+    cols = list(value_columns)
+    df = ldf.filter(pl.col(key_column).is_in(list(keys))).select([key_column, *cols]).collect()
+    return {r[0]: dict(zip(cols, r[1:])) for r in df.rows()}
 
-def build_sequences_from_map(mapping: dict, item_lists: list[list],
+def build_map(ldf: pl.LazyFrame, keys: Iterable,
+              key_column: str = ITEM, value_column: str = EMBEDDING) -> dict[Any, Any]:
+    """
+    :param ldf: LazyFrame from which items will be mapped
+    :param keys: keys to map
+    :param key_column: column to select as key from ldf
+    :param value_column: column to select as value from ldf
+    :return: mapping key -> value
+    """
+
+    df = ldf.filter(pl.col(key_column).is_in(list(keys))).select([key_column, value_column]).collect()
+    return {r[0]: r[1] for r in df.rows()}
+
+def build_sequences_from_map(mapping: dict, key_lists: list[list[Any]],
                              batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
                              device: torch.device | str = 'cpu') -> Tensor:
     """
-    :return: Tensor (B, T, D) if batch_first else (T, B, D)
+    :return: Tensor (B, T, *) if batch_first else (T, B, *)
     """
     return pad_sequence([
-        torch.from_numpy(np.stack([mapping[it] for it in item_list]))
-        for item_list in item_lists
-    ], padding_value=0.0, batch_first=batch_first, padding_side=padding_side).to(dtype=torch.float32, device=device)
+        torch.tensor([mapping[it] for it in item_list])
+        for item_list in key_lists
+    ], padding_value=0, batch_first=batch_first, padding_side=padding_side).to(device=device)
 
-def build_embedding_sequences(items_df: pl.LazyFrame, item_lists: list[list],
-                              batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
-                              device: torch.device | str = 'cpu') -> Tensor:
+def build_sequences(items_df: pl.LazyFrame, key_lists: list[list[Any]],
+                    key_column: str = ITEM, value_column: str = EMBEDDING,
+                    batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
+                    device: torch.device | str = 'cpu') -> Tensor:
     """
     :return: Tensor (B, T, D) if batch_first else (T, B, D)
     """
-    mapping = build_embeddings_map(items_df, set().union(*item_lists))
-    return build_sequences_from_map(mapping, item_lists, device=device, batch_first=batch_first, padding_side=padding_side)
+    mapping = build_map(items_df, keys=set().union(*key_lists), key_column=key_column, value_column=value_column)
+    return build_sequences_from_map(mapping, key_lists, device=device, batch_first=batch_first, padding_side=padding_side)
 
-def build_mask(item_lists: list[list],
+def build_mask(lists: list[list[Any]],
                batch_first: bool = False, padding_side: Literal['left', 'right'] = 'right',
                device: torch.device| str = 'cpu'):
     """
     :return: Bool Tensor (B, T) if batch_first else (T, B)
     """
-    lengths = torch.tensor([len(l) for l in item_lists])
+    lengths = torch.tensor([len(l) for l in lists])
     max_len = lengths.max().item()
     indices = torch.arange(max_len)
 
@@ -130,7 +169,12 @@ def build_mask(item_lists: list[list],
         return mask.t()
     return mask
 
+
 def count_params(model: Module) -> int:
+    """
+    :param model: nn.Module
+    :return: number of trainable parameters
+    """
     pp=0
     for p in list(model.parameters()):
         nn=1
@@ -139,7 +183,21 @@ def count_params(model: Module) -> int:
         pp += nn
     return pp
 
+def count_polars(df: pl.LazyFrame | pl.DataFrame) -> int:
+    length = df.select(pl.len())
+
+    if isinstance(length, pl.LazyFrame):
+        length = length.collect()
+
+    return length.item()
+
 def sample_polars(ldf: pl.LazyFrame , n_rows: Optional[int] = None, id_columns: Optional[list[str]] = None):
+    """
+    :param ldf: polars LazyDataFrame
+    :param n_rows: number of rows to sample
+    :param id_columns: optional columns, containing unique id for each row
+    :return: polars LazyFrame with 'n_rows' rows sampled randomly
+    """
     if n_rows is None:
         return ldf
 
@@ -153,3 +211,11 @@ def sample_polars(ldf: pl.LazyFrame , n_rows: Optional[int] = None, id_columns: 
     sampled = lazy_with_hash.sort('_row_hash').head(n_rows).drop('_row_hash')
 
     return sampled
+
+def clear_cache(dir: str = CACHE_DIR, files_to_keep: list[str] = ()):
+    for item_name in os.listdir(dir):
+        if item_name not in files_to_keep:
+            try:
+                os.remove(os.path.join(dir, item_name))
+            except OSError as e:
+                print(f"Error deleting {item_name}: {e}")

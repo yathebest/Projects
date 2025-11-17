@@ -8,8 +8,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch import Tensor
 
 from .BaseRecurrentModel import BaseRecurrentModel
-from libs.constants import *
-from libs.utils import build_embedding_sequences
+from ..constants import *
+from ..utils import build_sequences
 
 
 class WeightedAvgModel(BaseRecurrentModel):
@@ -29,15 +29,16 @@ class WeightedAvgModel(BaseRecurrentModel):
         self.alpha = alpha
         self.temp = temp
 
-    def process_data_batch(self, data_batch: pl.DataFrame, items_df: pl.LazyFrame,
+    def process_data_batch(self, batch: pl.DataFrame,
+                           items_df: pl.LazyFrame, users_df: pl.LazyFrame,
                            mode: Literal['train', 'val', 'predict'] = 'train') -> Union[NDArray, Tensor]:
-        device = next(self.parameters()).device if any(p.numel() for p in self.parameters()) else torch.device('cpu')
+        device = self.device
 
-        item_lists = data_batch[ITEM].to_list()
-        time_index_lists = data_batch[TIME_INDEX].to_list()
-        target_lists = data_batch[TARGET].to_list()
+        item_lists = batch[ITEM].to_list()
+        time_index_lists = batch[TIME_INDEX].to_list()
+        target_lists = batch[TARGET].to_list()
 
-        inputs = build_embedding_sequences(items_df, item_lists, batch_first=False, device=device)  # (T, B, D)
+        inputs = build_sequences(items_df, item_lists, batch_first=False, device=device)  # (T, B, D)
 
         weights = pad_sequence([  # (T, B)
             torch.from_numpy(self._get_weights(row_time, row_target))

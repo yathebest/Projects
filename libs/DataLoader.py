@@ -14,6 +14,11 @@ from .utils import count_polars
 class Loader:
     MAX_WEEKS = 25
     TEST_WEEK = 25
+
+    TRAIN = "train"
+    VAL = "val"
+    TEST = "test"
+
     """
     :param subsample_name: name of subsample to download
     :param content_embedding_size: items embeddings dimension
@@ -29,6 +34,9 @@ class Loader:
         self.batch_size = batch_size
         self.all_weeks = all_weeks
         self.val_weeks = val_weeks
+
+        self.metadata: dict[str, pl.LazyFrame] = {}
+        self.datasets = {}
 
         if not (0 <= self.val_weeks <= self.all_weeks <= Loader.MAX_WEEKS):
             raise NotImplementedError()
@@ -86,11 +94,26 @@ class Loader:
 
     def _create_target_expression(self) -> pl.Expr:
         target_expr = pl.lit(0)
-        for interaction, weight in INTERACTIONS_MAP.items():
+        for interaction, weight in TARGET_MAP.items():
             target_expr = target_expr + pl.col(interaction) * weight
         return target_expr.alias(TARGET)
 
+    def _load_and_process_metadata(self):
+        users_metadata, items_metadata, item_ids, item_embeddings = self._load_metadata()
+        all_users, all_items = self._get_unique_users_items()
+        filtered_ids, filtered_embeddings = self._filter_embeddings(item_ids, item_embeddings, all_items)
+
+        users_metadata, items_metadata = self._process_metadata(
+            users_metadata, items_metadata, all_users, all_items,
+            filtered_ids, filtered_embeddings
+        )
+
+        self.metadata[USER] = users_metadata
+        self.metadata[ITEM] = items_metadata
+
     def _load_metadata(self) -> Tuple[pl.LazyFrame, pl.LazyFrame, np.ndarray, np.ndarray]:
+        print("Load metadata")
+
         users_metadata = pl.scan_parquet(f'{DATA_DIR}/metadata/users_metadata.parquet')
         items_metadata = pl.scan_parquet(f'{DATA_DIR}/metadata/items_metadata.parquet')
 
@@ -100,8 +123,9 @@ class Loader:
 
         return users_metadata, items_metadata, item_ids, item_embeddings
 
-    def _create_lazy_datasets(self) -> Tuple[pl.LazyFrame, pl.LazyFrame, pl.LazyFrame]:
-        # train/val lists come from _get_files; test_files are returned and used here
+    def _create_datasets(self):
+        print("Create lazy interaction datasets")
+
         (train_files, val_files), test_files, _ = self._get_files()
         train, val, test = [], [], []
         time_offset = 0
@@ -124,30 +148,36 @@ class Loader:
             time_offset += count_polars(df)
             test.append(df)
 
-        return (pl.concat(train) if train else pl.LazyFrame(pl.DataFrame()),
-                pl.concat(val) if val else pl.LazyFrame(pl.DataFrame()),
-                pl.concat(test) if test else pl.LazyFrame(pl.DataFrame()))
+        self.datasets[Loader.TRAIN] = pl.concat(train) if train else pl.LazyFrame(pl.DataFrame())
+        self.datasets[Loader.VAL] = pl.concat(val) if val else pl.LazyFrame(pl.DataFrame())
+        self.datasets[Loader.TEST] = pl.concat(test) if test else pl.LazyFrame(pl.DataFrame())
 
-    def _get_unique_items_users(self, data_lazy: pl.LazyFrame) -> Tuple[pl.Series, pl.Series]:
-        items_set = set()
+    def _get_unique_users_items(self) -> Tuple[pl.Series, pl.Series]:
+        print("Get unique users/items")
+
         users_set = set()
+        items_set = set()
 
-        iterable: tqdm_asyncio[pl.DataFrame] = tqdm(
-            data_lazy.collect_batches(chunk_size=self.batch_size),
-            total=self._get_num_batches(data_lazy),
-        ) if self.batch_size is not None else [data_lazy.collect()]
+        for ldf in self.datasets.values():
+            iterable: tqdm_asyncio[pl.DataFrame] = tqdm(
+                ldf.collect_batches(chunk_size=self.batch_size),
+                total=self._get_num_batches(ldf),
+            ) if self.batch_size is not None else [ldf.collect()]
 
-        for batch in iterable:
-            if ITEM in batch.columns:
-                items_set.update(batch[ITEM].unique().to_list())
-            if USER in batch.columns:
-                users_set.update(batch[USER].unique().to_list())
+            for batch in iterable:
+                if ITEM in batch.columns:
+                    items_set.update(batch[ITEM].unique().to_list())
+                if USER in batch.columns:
+                    users_set.update(batch[USER].unique().to_list())
 
-        items_series = pl.Series(ITEM, list(items_set))
         users_series = pl.Series(USER, list(users_set))
-        return items_series, users_series
+        items_series = pl.Series(ITEM, list(items_set))
+
+        return users_series, items_series
 
     def _filter_embeddings(self, item_ids: np.ndarray, item_embeddings: np.ndarray, items: pl.Series):
+        print("Filter embeddings")
+
         mask = np.isin(item_ids, items.to_list())
         filtered_ids = item_ids[mask]
         filtered_embeddings = item_embeddings[mask]
@@ -158,6 +188,8 @@ class Loader:
     def _process_metadata(self, users_metadata: pl.LazyFrame, items_metadata: pl.LazyFrame,
                           users: pl.Series, items: pl.Series,
                           filtered_ids: np.ndarray, filtered_embeddings: np.ndarray):
+        print("Process metadata")
+
         users_df = pl.LazyFrame({USER: users})
         items_df = pl.LazyFrame({ITEM: items})
 
@@ -169,14 +201,26 @@ class Loader:
 
         return users_metadata, items_metadata
 
-    def _compute_aggregates(self, data_lazy: pl.LazyFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    def _calculate_features(self):
+        print("Calculate features")
+
+        for name, ldf in self.datasets.items():
+            self.datasets[name] = ldf \
+                .join(self.metadata[ITEM].select([ITEM, "duration"]), on=ITEM, how="left") \
+                .with_columns(timeratio=pl.col("timespent") / pl.col("duration"))
+
+    def _compute_aggregates(self):
+        print("Compute aggregates")
+
         users_acc = None
         items_acc = None
 
+        train = self.datasets[Loader.TRAIN]
+
         iterable: tqdm_asyncio[pl.DataFrame] = tqdm(
-            data_lazy.collect_batches(chunk_size=self.batch_size),
-            total=self._get_num_batches(data_lazy),
-        ) if self.batch_size is not None else [data_lazy.collect()]
+            train.collect_batches(chunk_size=self.batch_size),
+            total=self._get_num_batches(train),
+        ) if self.batch_size is not None else [train.collect()]
 
         for batch in iterable:
             batch = batch.with_columns([self._create_target_expression()])
@@ -222,118 +266,73 @@ class Loader:
 
         return users_acc, items_acc
 
-    def _filter_data(self, users_agg: pl.DataFrame, items_agg: pl.DataFrame,
-                     users_metadata: pl.LazyFrame, items_metadata: pl.LazyFrame,
-                     train: pl.LazyFrame, val: pl.LazyFrame, test: pl.LazyFrame):
+    def _filter_datasets(self, users_agg: pl.DataFrame, items_agg: pl.DataFrame):
+        print("Filter interactions")
+
         users_filtered = users_agg.filter(
             (pl.col("count") > 100) &
             (pl.col("positive") / pl.col("count") > 0.05) &
             (pl.col("negative") / pl.col("count") < 0.05)
         )
-        items_filtered = items_agg  # keep as-is (you can add item-level filters here)
+        items_filtered = items_agg
 
-        # convert filtered user/item lists to Python lists (should fit memory)
         users_keep = users_filtered.select(USER).to_series().to_list()
         items_keep = items_filtered.select(ITEM).to_series().to_list()
 
-        users_metadata = users_metadata.join(
-            pl.DataFrame({USER: users_keep}).lazy(), on=USER, how='inner'
-        )
-        items_metadata = items_metadata.join(
-            pl.DataFrame({ITEM: items_keep}).lazy(), on=ITEM, how='inner'
-        )
+        users_keep_lazy = pl.DataFrame({USER: users_keep}).lazy()
+        items_keep_lazy = pl.DataFrame({ITEM: items_keep}).lazy()
 
-        # Build lazy selections for joins on large datasets
-        users_keep_lazy = pl.DataFrame({USER: users_keep}).lazy().select(USER)
-        items_keep_lazy = pl.DataFrame({ITEM: items_keep}).lazy().select(ITEM)
+        self.metadata[USER] = self.metadata[USER].join(users_keep_lazy, on=USER, how='inner')
+        self.metadata[ITEM] = self.metadata[ITEM].join(items_keep_lazy, on=ITEM, how='inner')
 
-        train_filtered = (train
-                          .join(users_keep_lazy, on=USER, how='inner')
-                          .join(items_keep_lazy, on=ITEM, how='inner'))
+        for name, ldf in self.datasets.items():
+            self.datasets[name] = ldf \
+                .join(users_keep_lazy, on=USER, how='inner')\
+                .join(items_keep_lazy, on=ITEM, how='inner')
 
-        val_filtered = (val
-                        .join(users_keep_lazy, on=USER, how='inner')
-                        .join(items_keep_lazy, on=ITEM, how='inner'))
-
-        test_filtered = (test
-                         .join(users_keep_lazy, on=USER, how='inner')
-                         .join(items_keep_lazy, on=ITEM, how='inner'))
-
-        return train_filtered, val_filtered, test_filtered, users_metadata, items_metadata
-
-    def load_data(self, convert_to_pandas=True, filter_data=True):
-        self._ensure_files_exist()
-
-        print("Load metadata")
-        users_metadata, items_metadata, item_ids, item_embeddings = self._load_metadata()
-
-        print("Create lazy interaction datasets")
-        train_lazy, val_lazy, test_lazy = self._create_lazy_datasets()
-
-        print("Get unique users/items")
-        train_items, train_users = self._get_unique_items_users(train_lazy)
-        val_items, val_users = self._get_unique_items_users(val_lazy)
-        test_items, test_users = self._get_unique_items_users(test_lazy)
-        all_items = pl.concat([train_items, val_items, test_items]).unique()
-        all_users = pl.concat([train_users, val_users, test_users]).unique()
-
-        print("Filter embeddings")
-        filtered_ids, filtered_embeddings = self._filter_embeddings(
-            item_ids, item_embeddings, all_items
-        )
-
-        print("Process metadata")
-        users_metadata, items_metadata = self._process_metadata(
-            users_metadata, items_metadata, all_users, all_items,
-            filtered_ids, filtered_embeddings
-        )
-
-        if not filter_data:
-            if convert_to_pandas:
-                return  (((train_lazy.collect().to_pandas(), val_lazy.collect().to_pandas()), test_lazy.collect().to_pandas()),
-                         users_metadata.collect().to_pandas(), items_metadata.collect().to_pandas())
-
-            return (train_lazy, val_lazy), test_lazy, users_metadata, items_metadata
-
-        print("Compute aggregates")
-        users_agg, items_agg = self._compute_aggregates(train_lazy)
-
-        print("Filter interactions")
-        train_filtered, val_filtered, test_filtered, users_metadata, items_metadata = self._filter_data(
-            users_agg, items_agg, users_metadata, items_metadata, train_lazy, val_lazy, test_lazy
-        )
-
+    def _finalize_datasets(self):
         print("Finalize interactions")
+
+        for name, ldf in self.metadata.items():
+            self.metadata[name] = ldf.drop("train_interactions_rank", strict=False)
+
         target_expr = self._create_target_expression()
+        for name, ldf in self.datasets.items():
+            self.datasets[name] = ldf \
+                .with_columns([target_expr]) \
+                .drop(list(TARGET_MAP.keys()), strict=False) \
+                .drop("train_interactions_rank", strict=False) \
+                .filter(pl.col(TARGET).ne(0))
 
-        train_final = (train_filtered
-                       .with_columns([target_expr])
-                       .drop(list(INTERACTIONS_MAP.keys()), strict=False)
-                       .drop("train_interactions_rank", strict=False)
-                       .filter(pl.col(TARGET).ne(0)))
-
-        val_final = (val_filtered
-                     .with_columns([target_expr])
-                     .drop(list(INTERACTIONS_MAP.keys()), strict=False)
-                     .drop("train_interactions_rank", strict=False)
-                     .filter(pl.col(TARGET).ge(0)))
-
-        test_final = (test_filtered
-                      .with_columns([target_expr])
-                      .drop(list(INTERACTIONS_MAP.keys()), strict=False)
-                      .drop("train_interactions_rank", strict=False)
-                      .filter(pl.col(TARGET).ge(0)))
-
-        users_metadata = users_metadata.drop("train_interactions_rank", strict=False)
-        items_metadata = items_metadata.drop("train_interactions_rank", strict=False)
-
-        print("Count")
-        print(f"Train: {count_polars(train_final):_} Val: {count_polars(val_final):_} Test: {count_polars(test_final):_} "
-              f"Users: {count_polars(users_metadata):_} Items: {count_polars(items_metadata):_}")
-
+    def _return_all(self, convert_to_pandas: bool):
+        train, val, test = (self.datasets[s] for s in [Loader.TRAIN, Loader.VAL, Loader.TEST])
+        users, items = (self.metadata[s] for s in [USER, ITEM])
         if convert_to_pandas:
             print("Convert to pandas")
-            return  (((train_final.collect().to_pandas(), val_final.collect().to_pandas()), test_final.collect().to_pandas()),
-                     users_metadata.collect().to_pandas(), items_metadata.collect().to_pandas())
+            return  (((train.collect().to_pandas(), val.collect().to_pandas()), test.collect().to_pandas()),
+                     users.collect().to_pandas(), items.collect().to_pandas())
 
-        return ((train_final, val_final), test_final), users_metadata, items_metadata
+        return ((train, val), test), users, items
+
+    def load_data(self, convert_to_pandas=True, filter_data=True):
+        """
+        :param convert_to_pandas: if True returns pandas DataFrames else polars LazyFrames
+        :param filter_data: if True heuristic filtering will be applied
+        :return: (((train, val), test), users, items)
+        """
+        self._ensure_files_exist()
+        self._create_datasets()
+        self._load_and_process_metadata()
+        self._calculate_features()
+
+        if not filter_data:
+            return self._return_all(convert_to_pandas)
+
+        self._filter_datasets(*self._compute_aggregates())
+        self._finalize_datasets()
+
+        print("Count")
+        print(" ".join(f"{name}: {count_polars(ldf):_}" for name, ldf in self.datasets.items()))
+        print(" ".join(f"{name}: {count_polars(ldf):_}" for name, ldf in self.metadata.items()))
+
+        return self._return_all(convert_to_pandas)

@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 
 from .Trainer import Trainer
 from .constants import *
-from .utils import build_embeddings_map, count_polars
+from .utils import build_map, count_polars
 
 U = TypeVar('U', bound=Hashable)
 I = TypeVar('I', bound=Hashable)
@@ -54,9 +54,10 @@ class Solver(Generic[I, U]):
         :param items_batch_size: batching for items
         :param train_data_only: if True, only train data will be used to for predict
         """
-        users_bar = tqdm(total=ceil(self.trainer.data_count / users_batch_size), position=0, desc="Users")
+        data_count = self.trainer.train_count if train_data_only else self.trainer.data_count
+        users_bar = tqdm(total=ceil(data_count / users_batch_size), position=0, desc="Users")
 
-        score_gen = self._score_generator(users_batch_size, items_batch_size)
+        score_gen = self._score_generator(users_batch_size, items_batch_size, train_data_only=train_data_only)
         for batch_scores, users, items in score_gen:
             n_users = batch_scores.shape[0]
 
@@ -99,14 +100,16 @@ class Solver(Generic[I, U]):
         for item in tqdm(list(self._item_to_user_score.keys()), desc="Clean up"):
             self._cleanup_item_heap(item)
 
-    def _score_generator(self, users_batch_size: int, items_batch_size: int) -> Iterable[Tuple[NDArray, list[U], list[I]]]:
+    def _score_generator(self, users_batch_size: int, items_batch_size: int, train_data_only: bool) -> Iterable[Tuple[NDArray, list[U], list[I]]]:
         items_bar = tqdm(total=ceil(self.predict_count / items_batch_size), position=2, desc="Predict Items")
 
-        users_iterable = self.trainer.data.collect_batches(chunk_size=users_batch_size)
+        data = self.trainer.train if train_data_only else self.trainer.data
+        users_iterable = data.collect_batches(chunk_size=users_batch_size)
+
         for data_batch in users_iterable:
             users = data_batch[USER].to_list()
 
-            user_embeddings = self.trainer.model.process_data_batch(data_batch, items_df=self.trainer.items_df, mode='predict')
+            user_embeddings = self.trainer.model.process_data_batch(data_batch, items_df=self.trainer.items_df, users_df=self.trainer.users_df, mode='predict')
             user_norms = np.linalg.norm(user_embeddings, axis=1, keepdims=True)
             user_norms[user_norms == 0] = EPS
 
@@ -117,7 +120,7 @@ class Solver(Generic[I, U]):
                 pred_items_batch = pred_batch[ITEM].to_list()
                 items.extend(pred_items_batch)
 
-                pred_item_to_emb = build_embeddings_map(self.trainer.items_df, pred_items_batch)
+                pred_item_to_emb = build_map(self.trainer.items_df, pred_items_batch)
 
                 item_embeddings = np.vstack([pred_item_to_emb[it] for it in pred_items_batch])  # (n_pred_batch, d)
                 item_norms = np.linalg.norm(item_embeddings, axis=1, keepdims=True)

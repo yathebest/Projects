@@ -3,7 +3,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import svds
 from tqdm.auto import trange
 
-from .constants import *
+from ..constants import *
 
 
 class SVDModel:

@@ -8,8 +8,8 @@ import torch.nn as nn
 from torch import Tensor
 
 from .BaseRecurrentModel import BaseRecurrentModel
-from libs.constants import *
-from libs.utils import build_embedding_sequences
+from ..constants import *
+from ..utils import build_sequences
 
 
 class RNNModel(BaseRecurrentModel):
@@ -65,13 +65,15 @@ class RNNModel(BaseRecurrentModel):
 
         return (out, hid) if return_hidden else out
 
-    def process_data_batch(self, data_batch: pl.DataFrame, items_df: pl.LazyFrame,
+    def process_data_batch(self, batch: pl.DataFrame,
+                           items_df: pl.LazyFrame, users_df: pl.LazyFrame,
                            mode: Literal['train', 'val', 'predict'] = 'train') -> Union[NDArray, Tensor]:
-        device = next(self.parameters()).device if any(p.numel() for p in self.parameters()) else torch.device('cpu')
-        item_lists = data_batch[ITEM].to_list()
+        device = self.device
+
+        item_lists = batch[ITEM].to_list()
 
         def _run() -> Tensor:
-            inputs = build_embedding_sequences(items_df, item_lists, device=device)
+            inputs = build_sequences(items_df, item_lists, device=device)
             return self.forward(inputs, return_hidden=False)
 
         if mode == 'train':

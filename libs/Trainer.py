@@ -11,9 +11,9 @@ from torch.optim import Optimizer
 from tqdm.asyncio import tqdm_asyncio
 from tqdm.auto import tqdm, trange
 
-from libs.models.BaseRecurrentModel import BaseRecurrentModel
+from .models.BaseRecurrentModel import BaseRecurrentModel
 from .constants import *
-from .utils import count_polars, build_mask, build_embeddings_map, build_sequences_from_map
+from .utils import count_polars, build_mask, build_map, build_sequences_from_map
 
 
 class Trainer:
@@ -21,7 +21,8 @@ class Trainer:
     :param model: Recurrent model to predict embeddings
     :param train_interactions: LazyFrame containing train interactions with columns [USER, ITEM, TARGET, TIME_INDEX]
     :param val_interactions: LazyFrame containing val interactions with columns [USER, ITEM, TARGET, TIME_INDEX]
-    :param items_metadata: LazyFrame containing all items metadata with columns [ITEM, EMBEDDING]
+    :param items_metadata: LazyFrame containing all items metadata with columns [ITEM, EMBEDDING, ITEM_CAT]
+    :param users_metadata: LazyFrame containing all items metadata with columns [USER, EMBEDDING]
     :param optimizer: optional torch optimizer. Will be created default if not provided and create_optimizer is not called
     :param loss_type: prefix 'pair_' = pairwise (no margin), 'triplet_' = margin-based (uses self.loss_margin and negatives)
     :param loss_margin: used for margin-based losses (with negative samples)
@@ -32,6 +33,7 @@ class Trainer:
     def __init__(self, model: BaseRecurrentModel,
                  train_interactions: pl.LazyFrame, val_interactions: pl.LazyFrame,
                  items_metadata: pl.LazyFrame,
+                 users_metadata: pl.LazyFrame,
                  optimizer: Optional[Optimizer] = None,
                  num_recent_videos: int = 500,
                  loss_type: Literal['pair_mse', 'triplet_mse', 'pair_cos', 'triplet_cos', 'ce'] = 'pair_mse',
@@ -44,12 +46,16 @@ class Trainer:
         self.optimizer = optimizer
         self.start_epoch = 1
         self.items_df = items_metadata
+        self.users_df = users_metadata
         self.loss_type = loss_type
         self.loss_margin = loss_margin
         self.negative_ratio = negative_ratio
         self.negative_loss_pooling = negative_loss_pooling
         self.device = device
         self.history = None
+        self._val_embeddings = None
+        self._idx_to_item = None
+        self._item_to_idx = None
 
         def _agg(interactions: pl.LazyFrame):
             return interactions \
@@ -70,21 +76,52 @@ class Trainer:
 
         print(f"Users: All: {self.data_count:_} Train: {self.train_count:_} Val: {self.val_count:_}")
 
+    @property
+    def val_embeddings(self):
+        """
+        :returns: Tensor (D, N)
+        """
+        if self._val_embeddings is None:
+            self._init_val_embeddings()
+        return self._val_embeddings
+
+    @property
+    def idx_to_item(self):
+        """
+        :returns: mapping index -> ITEM
+        """
+        if self._idx_to_item is None:
+            self._init_val_mappings()
+        return self._idx_to_item
+
+    @property
+    def item_to_idx(self):
+        """
+        :returns: mapping ITEM -> index
+        """
+        if self._item_to_idx is None:
+            self._init_val_mappings()
+        return self._item_to_idx
+
     def create_optimizer(self, cls: str = 'AdamW', *args, **kwargs):
         self.optimizer = getattr(torch.optim, cls)(self.model.parameters(), *args, **kwargs)
 
-    def load_checkpoint(self, path: str = "./checkpoints/model.pt"):
+    def load_checkpoint(self, path: str = f"{MODELS_DIR}/model.pt"):
+        if self.optimizer is None:
+            self.create_optimizer()
+
         chkpt = torch.load(path)
         self.model.load_state_dict(chkpt["model_dict"])
         self.optimizer.load_state_dict(chkpt["optimizer_dict"])
         self.start_epoch = chkpt["epoch"] + 1
         self.history = chkpt["history"]
 
-    def train_epoch(self, users_batch_size: int = 4096, epoch: Optional[int] = None, verbose=True) -> float:
+    def process_epoch(self, users_batch_size: int = 4096, epoch: Optional[int] = None, verbose=True):
         self.model.train()
 
         total_batches = max(1, ceil(self.train_count / users_batch_size)) if self.train_count else 1
         running_loss = 0.0
+        running_val_ndcg = 0.0
         processed_batches = 0
 
         bar: tqdm_asyncio[pl.DataFrame] = tqdm(
@@ -94,28 +131,52 @@ class Trainer:
             desc=f"Train Epoch: {epoch}" if epoch is not None else "Train Epoch"
         )
 
-        for data_batch in bar:
-            predict = self.model.process_data_batch(data_batch, items_df=self.items_df, mode='train')
-            predict = predict[:-1]
+        for batch in bar:
+            item_lists = batch[ITEM].to_list()
 
-            target, mask, neg = self._build_target(data_batch[ITEM].to_list())
+            predict = self.model.process_data_batch(batch, items_df=self.items_df, users_df=self.users_df, mode='train')
+            predict_embeddings = predict[EMBEDDING]
+
+            target, mask, neg = self._build_target(item_lists)
             target, mask = target[1:], mask[1:]
             if neg is not None:
                 neg = neg[1:]
 
-            batch_loss = self._compute_loss(predict, target, mask, neg)
+            batch_loss = self._compute_loss(predict_embeddings[:-1], target, mask, neg)
 
             self.optimizer.zero_grad()
             batch_loss.backward()
             self.optimizer.step()
 
-            running_loss += float(batch_loss.item())
+            with torch.no_grad():
+                predict_embeddings = predict_embeddings.detach()
+                lasts = torch.tensor([len(l)-1 for l in item_lists], dtype=torch.long, device=self.device)
+                batch_indices = torch.arange(len(lasts))
+                last_pred = predict_embeddings[lasts, batch_indices]
+
+                last_logits = torch.mm(
+                    F.normalize(last_pred, p=2, dim=-1),    # (B, D)
+                    self.val_embeddings,                    # (D, N)
+                )                                           # (B, N)
+
+                k = min(TOP_PER_ITEM, last_logits.size(1))
+                top_k = last_logits.topk(k, dim=-1).indices # (B, k)
+                batch_val = self.val.join(batch.select(USER).lazy(), on=USER, how='right').collect()
+
+                batch_ndcg = self._calculate_ndcg(top_k, batch_val[ITEM], self.idx_to_item, k)
+
+            running_loss += batch_loss.item()
+            running_val_ndcg += batch_ndcg
             processed_batches += 1
 
-            avg_loss = running_loss / processed_batches if processed_batches else 0.0
-            bar.set_description(f"Train Epoch: {epoch} Loss: {avg_loss:.4f}" if epoch is not None else f"Train Loss: {avg_loss:.4f}")
+            avg_loss = running_loss / processed_batches
+            avg_ndcg = running_val_ndcg / processed_batches
+            bar.set_description((f"Epoch: {epoch} " if epoch is not None else "Epoch ") +
+                                f"Train Loss: {avg_loss:.4f} Val NDCG: {avg_ndcg:.4f}")
 
-        return (running_loss / processed_batches) if processed_batches else 0.0
+        avg_loss = running_loss / processed_batches if processed_batches else 0.0
+        avg_ndcg = running_val_ndcg / processed_batches if processed_batches else 0.0
+        return avg_loss, avg_ndcg
 
     def val_epoch(self, users_batch_size: int = 4096, epoch: Optional[int] = None, verbose=True) -> float | None:
         if self.val is None:
@@ -135,26 +196,30 @@ class Trainer:
         )
 
         with torch.no_grad():
-            for data_batch in bar:
-                predict = self.model.process_data_batch(data_batch, items_df=self.items_df, mode='val')
-                predict = predict[:-1]  # t-1
+            for batch in bar:
+                predict = self.model.process_data_batch(batch, items_df=self.items_df, users_df=self.users_df, mode='val')
+                predict_embeddings = predict[EMBEDDING][:-1]  # t-1
 
-                target, mask, neg = self._build_target(data_batch[ITEM].to_list())
+                target, mask, neg = self._build_target(batch[ITEM].to_list())
                 target, mask = target[1:], mask[1:] # t+1
                 if neg is not None:
                     neg = neg[1:]
 
-                batch_loss = self._compute_loss(predict, target, mask, neg)
+                batch_loss = self._compute_loss(predict_embeddings, target, mask, neg)
 
-                running_loss += float(batch_loss.cpu().item())
+                running_loss += batch_loss.item()
                 processed_batches += 1
 
-                avg_loss = running_loss / processed_batches if processed_batches else 0.0
-                bar.set_description(f"Val Epoch: {epoch} Loss: {avg_loss:.4f}" if epoch is not None else f"Val Loss: {avg_loss:.4f}")
+                avg_loss = running_loss / processed_batches
 
-        return (running_loss / processed_batches) if processed_batches else 0.0
+                bar.set_description((f"Epoch: {epoch} " if epoch is not None else "Epoch ") +
+                                    f"Val Loss: {avg_loss:.4f}")
 
-    def fit(self, epochs: int = 5, users_batch_size: int = 4096, patience: Optional[int] = None,
+        avg_loss = running_loss / processed_batches if processed_batches else 0.0
+        return avg_loss
+
+    def fit(self, epochs: int = 5, users_batch_size: int = 4096,
+            patience: Optional[int] = None, warmup: int = 0,
             save: bool = True, verbose: bool = True,
             save_name = "model.pt"):
         if not self.model.trainable:
@@ -165,43 +230,45 @@ class Trainer:
             self.create_optimizer()
             print("Default optimizer created")
 
-        self.history: dict[str, list] = {'train_loss': [], 'val_loss': []}
-        best = (-1, float('inf'), deepcopy(self.model.state_dict()))
+        self.history: dict[str, list] = {'train_loss': [], 'val_loss': [], 'val_ndcg': []}
+        best = (-1, float("-inf"), deepcopy(self.model.state_dict()))
         no_improvement = 0
 
         bar = trange(self.start_epoch, epochs + 1, disable=verbose)
         try:
             for epoch in bar:
-                train_loss = self.train_epoch(users_batch_size=users_batch_size, epoch=epoch, verbose=verbose)
-                val_loss = self.val_epoch(users_batch_size=2*users_batch_size, epoch=epoch, verbose=verbose)
-                candidate_loss = val_loss or train_loss
+                train_loss, val_ndcg = self.process_epoch(users_batch_size, epoch, verbose)
+                val_loss = self.val_epoch(2*users_batch_size, epoch, verbose)
 
                 self.history['train_loss'].append(train_loss)
                 self.history['val_loss'].append(val_loss)
+                self.history['val_ndcg'].append(val_ndcg)
 
                 bar.set_description(f"Epoch: {epoch} Train Loss: {train_loss:.4f}" +
                                     (f" Val Loss: {val_loss:.4f}" if val_loss else "") +
                                     f"Best Epoch: {best[0]}")
 
-                if candidate_loss < best[1]:
-                    best = (epoch, candidate_loss, deepcopy(self.model.state_dict()))
+                if val_ndcg > best[1]:
+                    best = (epoch, val_ndcg, deepcopy(self.model.state_dict()))
                     no_improvement = 0
 
                     if save:
-                        if not os.path.exists("./checkpoints"):
-                            os.mkdir("./checkpoints")
+                        if not os.path.exists(MODELS_DIR):
+                            os.mkdir(MODELS_DIR)
                         torch.save({
                             "model_dict": self.model.state_dict(),
                             "optimizer_dict": self.optimizer.state_dict(),
                             "epoch": epoch,
                             "history": self.history,
-                        }, f"./checkpoints/{save_name}")
+                        }, f"{MODELS_DIR}/{save_name}")
+                elif epoch > warmup:
+                    no_improvement += 1
 
                 if no_improvement == patience:
                     print("Early stop")
                     break
 
-            print(f"Completed! Best Loss {best[1]:.4f} at Epoch {best[0]}")
+            print(f"Completed! Best NDCG {best[1]:.4f} at Epoch {best[0]}")
             self.model.load_state_dict(best[2])
 
         except Exception as e:
@@ -211,9 +278,9 @@ class Trainer:
 
     def _build_target(self, item_lists: list[list]) -> tuple[Tensor, Tensor, Optional[Tensor]]:
         """
-        :returns tuple of Tensors: target (T, B, D), mask (T, B), Optional[negatives (T, B, K, D)]
+        :returns: tuple of Tensors: target (T, B, D), mask (T, B), negatives (T, B, K, D) or None
         """
-        mapping = build_embeddings_map(self.items_df, set().union(*item_lists))
+        mapping = build_map(self.items_df, set().union(*item_lists))
         target = build_sequences_from_map(mapping, item_lists, batch_first=False, padding_side=self.model.padding_side, device=self.device)
         mask = build_mask(item_lists, batch_first=False, padding_side=self.model.padding_side, device=self.device)
         negatives = self._sample_negatives(mapping, item_lists) if self.negative_ratio > 0 else None
@@ -233,7 +300,7 @@ class Trainer:
 
         id2idx = {it: idx for idx, it in enumerate(unique_items)}
 
-        emb_list = [torch.from_numpy(embeddings_mapping[it]).to(self.device).float() for it in unique_items]
+        emb_list = [torch.tensor(embeddings_mapping[it], device=self.device, dtype=torch.float) for it in unique_items]
         emb_matrix = torch.stack(emb_list, dim=0)  # (M, D)
 
         mask_allowed = torch.ones((B, M), dtype=torch.bool, device=self.device)
@@ -253,7 +320,7 @@ class Trainer:
 
         def sample_for_users(user_idx_tensor, replacement: bool):
             """
-            :returns Tensor (T, len(user_idx_tensor), K) of indicis with sampled local item indices.
+            :returns: Tensor (T, len(user_idx_tensor), K) of indicis with sampled local item indices.
             """
             if user_idx_tensor.numel() == 0:
                 return None
@@ -301,7 +368,7 @@ class Trainer:
 
         predict_flat = predict.reshape(T*B, D)   # (T*B, D)
         target_flat = target.reshape(T*B, D)     # (T*B, D)
-        mask_flat = mask.reshape(T*B)               # (T*B)
+        mask_flat = mask.reshape(T*B)            # (T*B)
         N = int(mask_flat.sum().item())
 
         if '_' in self.loss_type:
@@ -396,3 +463,57 @@ class Trainer:
             return F.cross_entropy(logits_sel, labels, reduction='mean')        # ()
 
         raise NotImplementedError(f"Loss type '{self.loss_type}' is not implemented.")
+
+    def _calculate_ndcg(self, top_k_indices: torch.Tensor, ground_truth_lists: list, idx_to_item: dict, k: int) -> float:
+        batch_size = top_k_indices.size(0)
+        device = top_k_indices.device
+
+        relevance_matrix = torch.zeros((batch_size, k), device=device)
+        for i in range(batch_size):
+            if ground_truth_lists[i] is None:
+                continue
+
+            pred_items = [idx_to_item[idx.item()] for idx in top_k_indices[i]][:k]
+            gt_items = set(ground_truth_lists[i])
+
+            for j, item in enumerate(pred_items):
+                if item in gt_items:
+                    relevance_matrix[i, j] = 1.0
+
+        discounts = 1.0 / torch.log2(torch.arange(2, k + 2, device=device, dtype=torch.float))
+        dcg = (relevance_matrix * discounts).sum(dim=1)  # (B)
+
+        num_relevant_per_user = torch.tensor([
+            min(len(set(gt)) if gt is not None else 0, k)
+            for gt in ground_truth_lists
+        ], device=device, dtype=torch.float)
+
+        max_relevant = int(num_relevant_per_user.max().item())
+        ideal_discounts = 1.0 / torch.log2(torch.arange(2, max_relevant + 2, device=device, dtype=torch.float))
+        ideal_cumsum = torch.cumsum(ideal_discounts, dim=0)
+
+        idcg = torch.zeros(batch_size, device=device)
+        for i in range(batch_size):
+            n_rel = int(num_relevant_per_user[i].item())
+            if n_rel > 0:
+                idcg[i] = ideal_cumsum[n_rel - 1]
+
+        mask = idcg > 0
+        return (dcg[mask] / idcg[mask]).mean().item()
+
+    def _init_val_mappings(self):
+        all_items = set().union(*self.val.select(ITEM).collect().to_series().to_list())
+        self._idx_to_item = dict(enumerate(all_items))
+        self._item_to_idx = {v: k for k, v in self._idx_to_item.items()}
+
+    def _init_val_embeddings(self):
+        all_items = set().union(*self.val.select(ITEM).collect().to_series().to_list())
+        self._idx_to_item = dict(enumerate(all_items))
+        self._item_to_idx = {v: k for k, v in self._idx_to_item.items()}
+
+        mapping = build_map(self.items_df, all_items, key_column=ITEM, value_column=EMBEDDING)
+        val_embeddings = torch.tensor(
+            [mapping[self._idx_to_item[i]] for i in range(len(all_items))],
+            dtype=torch.float, device=self.device,
+        )
+        self._val_embeddings = F.normalize(val_embeddings, p=2, dim=-1).t()  # (D, N)
